@@ -12,6 +12,7 @@ from tradingkit.aggregation import (
     Aggregation,
     AggregationContext,
     AggregationScript,
+    AggregationWorker,
     ScriptAggregation,
     SourceRef,
     load_aggregation_plugin,
@@ -184,6 +185,19 @@ def test_load_aggregation_plugin_builtin_registry(monkeypatch):
     agg = load_aggregation_plugin("my_agg", {})
     assert isinstance(agg, ScriptAggregation)
     assert agg.OUTPUT_TABLE == "spread_btc_eth"
+
+
+async def test_worker_does_not_run_builtins_nobody_added(monkeypatch):
+    # Regression: builtin templates ran on a fresh install and polled tables that didn't exist.
+    monkeypatch.setenv("TRADINGKIT_AGGREGATIONS_MODULE", "tests._fixtures.fake_registry")
+
+    class _EmptyLibrary:
+        _conn = object()
+
+        async def _execute(self, sql, params=None):
+            return []
+
+    assert await AggregationWorker(_EmptyLibrary())._load_python_scripts() == []
 
 
 # ---------------------------------------------------------------------------

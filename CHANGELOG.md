@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Minute bars were stored under the connection's timeframe.** A source always writes
+  one-minute units, but `_ConnectionWorker` labelled them with `conn["timeframe"]`, so a
+  `1h` connection filled the `1h` label with 60s-spaced rows that charts drew as hourly
+  candles. Rows are now always labelled `1m`, a different requested timeframe logs a
+  warning, and higher timeframes come from aggregation as designed.
+- **`fetch_data()` could return one timestamp several times.** The live stream re-inserts
+  the forming bar, and without `FINAL` every unmerged row reached the caller.
+
+### Changed
+- **`AggregationWorker` runs only what is in `plugin_library`.** It used to fall back to
+  the host app's `BUILTIN_AGGREGATIONS`, so a fresh install ran templates nobody had added
+  and polled tables that did not exist. Builtins remain available as templates.
+
+### Added
+- **`script_params()` / `resolve_params()`** in `tradingkit.core.script_ast`: one exec-free
+  reader for `__params__`, with values cast to the declared type and checked against
+  `options`, `min` and `max`. A host app can build a form from a script and keep the values
+  outside its code.
+
+### Fixed
+- **`__params__` defaults were silently lost on indicators.** `_extract_defaults()` matched
+  with a regex that stopped at the first `}`, so the documented nested declaration parsed
+  to nothing. It now goes through `resolve_params()`.
+
 ## [0.5.0] - 2026-08-09
 
 Analytics come back as user-written plugins, and the regression 0.4.0 shipped is fixed.

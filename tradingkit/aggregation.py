@@ -522,11 +522,11 @@ class AggregationWorker:
         Return all Aggregation instances from plugin_library that AREN'T within-table
         aggregation(unit) scripts (AggregationScript.is_ch_mv() — a different mechanism
         entirely, consumed by DataCollector, sharing the same type='aggregation' rows).
-        Falls back to app-level BUILTIN_AGGREGATIONS for development/testing.
-        """
-        from tradingkit.core.plugin_registry import get_builtin_registry
-        _APP_BUILTINS = get_builtin_registry("TRADINGKIT_AGGREGATIONS_MODULE", "BUILTIN_AGGREGATIONS")
 
+        Only what the user put in the library runs. BUILTIN_AGGREGATIONS are templates to
+        start from, not jobs: running them here made a fresh install poll tables nobody
+        had created.
+        """
         results: list[dict] = []
 
         if self._db._conn:
@@ -540,16 +540,6 @@ class AggregationWorker:
                     continue
                 results.append({
                     "namespace": namespace, "name": name,
-                    "agg": ScriptAggregation(code=code),
-                })
-
-        existing_names = {r["name"] for r in results}
-        for name, code in _APP_BUILTINS.items():
-            if name not in existing_names:
-                if AggregationScript(code).is_ch_mv():
-                    continue
-                results.append({
-                    "namespace": "shared", "name": name,
                     "agg": ScriptAggregation(code=code),
                 })
 

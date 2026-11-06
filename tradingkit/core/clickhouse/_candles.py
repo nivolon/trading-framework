@@ -50,9 +50,11 @@ class _CandlesMixin:
             where += " AND timestamp <= %(et)s"; params["et"] = end_ts
         order_dir = "DESC" if order.upper() == "DESC" else "ASC"
         lim_sql = f"LIMIT {int(limit)}" if limit else ""
+        # FINAL: the live stream re-inserts the still-forming bar on every update, so until a
+        # background merge runs, one timestamp has several rows and a chart would get them all.
         sql = f"""
             SELECT timestamp, open, high, low, close, volume
-            FROM {table_name}
+            FROM {table_name} FINAL
             WHERE {where}
             ORDER BY timestamp {order_dir} {lim_sql}
         """

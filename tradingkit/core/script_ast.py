@@ -73,4 +73,65 @@ class ScriptAST:
         return None
 
 
-__all__ = ["ScriptAST"]
+_PARAM_TYPES = {bool: "bool", int: "int", float: "float", str: "str"}
+
+
+def script_params(code: str) -> dict[str, dict[str, Any]]:
+    """The `__params__` a script declares, normalised to `{name: {"type", "default", ...}}`
+    and read without executing it. A bare `"period": 14` is shorthand for a default, with
+    the type taken from that value."""
+    declared = ScriptAST(code).get_literal("__params__")
+    if not isinstance(declared, dict):
+        return {}
+    params: dict[str, dict[str, Any]] = {}
+    for name, spec in declared.items():
+        entry = dict(spec) if isinstance(spec, dict) else {"default": spec}
+        entry.setdefault("type", _PARAM_TYPES.get(type(entry.get("default")), "str"))
+        params[name] = entry
+    return params
+
+
+def _cast_param(name: str, value: Any, spec: dict[str, Any]) -> Any:
+    kind = spec["type"]
+    try:
+        if kind == "bool":
+            if isinstance(value, str) and value.lower() in ("true", "false"):
+                result: Any = value.lower() == "true"
+            elif isinstance(value, bool):
+                result = value
+            else:
+                raise ValueError
+        elif kind == "int":
+            if isinstance(value, bool) or not float(value).is_integer():
+                raise ValueError
+            result = int(float(value))
+        elif kind == "float":
+            if isinstance(value, bool):
+                raise ValueError
+            result = float(value)
+        else:
+            result = value
+    except (TypeError, ValueError):
+        raise ValueError(f"{name}: expected {kind}, got {value!r}") from None
+
+    if "options" in spec and result not in spec["options"]:
+        raise ValueError(f"{name}: {result!r} is not one of {spec['options']}")
+    if "min" in spec and result < spec["min"]:
+        raise ValueError(f"{name}: {result!r} is below the minimum {spec['min']}")
+    if "max" in spec and result > spec["max"]:
+        raise ValueError(f"{name}: {result!r} is above the maximum {spec['max']}")
+    return result
+
+
+def resolve_params(code: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Values a script runs with: its `__params__` defaults, then `overrides` cast to the
+    declared type. Keeps code a template -- the values live with whoever runs it. Raises
+    ValueError on a value that doesn't fit; names not declared pass through untouched."""
+    schema = script_params(code)
+    values = {name: spec["default"] for name, spec in schema.items() if "default" in spec}
+    for name, value in (overrides or {}).items():
+        values[name] = _cast_param(name, value, schema[name]) if name in schema else value
+    return values
+
+
+__all__ = ["ScriptAST", "resolve_params", "script_params"]

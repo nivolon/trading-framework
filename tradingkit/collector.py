@@ -105,7 +105,16 @@ class _ConnectionWorker:
 
         self._exchange  = (conn.get("source") or "").replace(".py", "")
         self._symbol    = conn["symbol"]
-        self._timeframe = conn.get("timeframe", "1m")
+
+        # Rows are always one-minute units, so that is their label whatever the connection
+        # asks for: storing them under conn["timeframe"] filed minute bars as "1h" candles,
+        # and higher timeframes come from aggregation anyway.
+        self._timeframe = "1m"
+        if conn.get("timeframe", "1m") != "1m":
+            logger.warning(
+                f"Connection {conn.get('name')!r}: timeframe {conn['timeframe']!r} ignored, "
+                "sources are collected as 1m units and aggregated upward"
+            )
 
         # Source always writes one unit per interval; framework aggregates upward via MV.
         # Expressed in the source's own timestamp unit (see DataSource.timestamp_unit),

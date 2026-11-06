@@ -176,6 +176,12 @@ async def test_worker_has_no_private_rate_limit_or_batcher():
 # Unit-agnostic wall-clock conversion                                  #
 # ------------------------------------------------------------------ #
 
+def test_rows_are_labelled_1m_whatever_the_connection_asks_for():
+    # Regression: a "1h" connection stored its minute bars under "1h", so that label held
+    # 60s-spaced rows and the chart drew them as hourly candles.
+    assert _make_worker(timeframe="1h")._timeframe == "1m"
+
+
 def test_unit_interval_follows_source_timestamp_unit():
     worker = _make_worker(source=FakeSource(timestamp_unit="ms"))
     assert worker._unit_interval == 60_000

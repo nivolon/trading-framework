@@ -6,13 +6,13 @@ Usage:
 """
 from __future__ import annotations
 
-import ast as _ast
-import re as _re
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
 import numpy as np
 import polars as pl
+
+from tradingkit.core.script_ast import resolve_params
 
 # ------------------------------------------------------------------ #
 # TA namespace                                                          #
@@ -302,18 +302,8 @@ ta_indicator = _TAIndicatorNS()
 # ------------------------------------------------------------------ #
 
 def _extract_defaults(code: str) -> dict[str, Any]:
-    """Parse ``__params__ = {...}`` literal from indicator code and return defaults."""
-    match = _re.search(r"__params__\s*=\s*(\{.*?\})", code, _re.DOTALL)
-    if not match:
-        return {}
-    try:
-        raw = _ast.literal_eval(match.group(1))
-        return {
-            k: (v["default"] if isinstance(v, dict) and "default" in v else v)
-            for k, v in raw.items()
-        }
-    except Exception:
-        return {}
+    """`__params__` defaults of indicator code."""
+    return resolve_params(code)
 
 
 def _make_talib_indicator(

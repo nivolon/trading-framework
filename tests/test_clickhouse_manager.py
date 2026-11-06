@@ -32,6 +32,15 @@ async def test_fetch_data_builds_select_with_filters(fake_ch_http):
     assert "timestamp <= 200" in sql
 
 
+async def test_fetch_data_reads_final_so_a_forming_bar_is_not_returned_twice(fake_ch_http):
+    fake_ch_http._responses.append(FakeChResponse(json_data={"data": []}))
+    db = ClickHouseManager()
+    db._conn = object()
+
+    await db.fetch_data("whitebit", "BTC_USDT", "1m")
+    assert "FROM candles FINAL" in _sql(fake_ch_http)
+
+
 async def test_fetch_data_parses_rows_into_dicts(fake_ch_http):
     fake_ch_http._responses.append(FakeChResponse(json_data={
         "data": [[1000, 1.0, 2.0, 0.5, 1.5, 10.0]],
