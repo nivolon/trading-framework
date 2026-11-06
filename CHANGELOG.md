@@ -21,6 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the host app's `BUILTIN_AGGREGATIONS`, so a fresh install ran templates nobody had added
   and polled tables that did not exist. Builtins remain available as templates.
 
+### Fixed
+- **Custom timeframes were treated as one minute.** `DependencyResolver` looked timeframes
+  up in a fixed table with a 60s fallback, so `7m` computed warmup and bucketing as `1m`.
+  It now uses `parse_timeframe()`.
+
+- **Built-in indicators computed nothing.** `fetch_ohlcv_aggregated()` filtered on
+  `timeframe = '60'` while rows are labelled `1m`, so the resolver always found no data.
+- **Indicators covered the oldest bars only.** The resolver fetched with the default limit
+  of 10000 in ascending order, so a longer history was cut off before the visible range.
+
+- **TA-Lib indicators could not run under `SubprocessExecutor`.** The class was defined
+  inside a function, so it could not be pickled.
+
 ### Added
 - **`script_params()` / `resolve_params()`** in `tradingkit.core.script_ast`: one exec-free
   reader for `__params__`, with values cast to the declared type and checked against

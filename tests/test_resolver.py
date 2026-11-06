@@ -36,7 +36,7 @@ class FakeDb:
     async def get_data_range(self, exchange, symbol, timeframe, **kw):
         return self.data_range
 
-    async def fetch_data_df(self, exchange, symbol, tf_seconds, start_ts, end_ts):
+    async def fetch_data_df(self, exchange, symbol, tf_seconds, start_ts, end_ts, limit=None):
         return self.ohlcv_df
 
     async def store_indicator(self, params, exchange, symbol, values):

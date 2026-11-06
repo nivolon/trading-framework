@@ -41,6 +41,17 @@ async def test_fetch_data_reads_final_so_a_forming_bar_is_not_returned_twice(fak
     assert "FROM candles FINAL" in _sql(fake_ch_http)
 
 
+async def test_fetch_data_df_aggregates_from_stored_1m_labels(fake_ch_http):
+    fake_ch_http._responses.append(FakeChResponse(json_data={"data": []}))
+    db = ClickHouseManager()
+    db._conn = object()
+
+    await db.fetch_data_df("whitebit", "BTC_USDT", 420, 0, 100)
+    sql = _sql(fake_ch_http)
+    assert "timeframe = '1m'" in sql
+    assert "INTERVAL 7 MINUTE" in sql
+
+
 async def test_fetch_data_parses_rows_into_dicts(fake_ch_http):
     fake_ch_http._responses.append(FakeChResponse(json_data={
         "data": [[1000, 1.0, 2.0, 0.5, 1.5, 10.0]],

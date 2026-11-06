@@ -306,6 +306,27 @@ def _extract_defaults(code: str) -> dict[str, Any]:
     return resolve_params(code)
 
 
+class _TalibIndicator(Indicator):
+    """Delegates to TA-Lib via ctx.ta. Module-level so executors can pickle it."""
+
+    def __init__(self, type_name: str, period: int, source: str, extra: dict) -> None:
+        super().__init__(period=period, source=source)
+        self._type_name = type_name
+        self._talib_period = period
+        self._talib_source = source
+        self._extra = extra
+
+    def compute(self, ctx: IndicatorContext) -> np.ndarray:
+        src = getattr(ctx.np, self._talib_source, ctx.np.close)
+        result = getattr(ctx.ta, self._type_name)(src, length=self._talib_period, **self._extra)
+        if isinstance(result, tuple):
+            return np.asarray(result[0], dtype=np.float64)
+        return np.asarray(result, dtype=np.float64)
+
+    def required_periods(self) -> int:
+        return self._talib_period
+
+
 def _make_talib_indicator(
     type_name: str,
     period: int,
@@ -313,24 +334,7 @@ def _make_talib_indicator(
     extra: dict,
 ) -> Indicator:
     """Create an Indicator that delegates to TA-Lib (via ctx.ta namespace)."""
-
-    class _TalibIndicator(Indicator):
-        _tn = type_name
-        _p  = period
-        _s  = source
-        _ex = extra
-
-        def compute(self, ctx: IndicatorContext) -> np.ndarray:
-            src = getattr(ctx.np, self._s, ctx.np.close)
-            result = getattr(ctx.ta, self._tn)(src, length=self._p, **self._ex)
-            if isinstance(result, tuple):
-                return np.asarray(result[0], dtype=np.float64)
-            return np.asarray(result, dtype=np.float64)
-
-        def required_periods(self) -> int:
-            return self._p
-
-    return _TalibIndicator(period=period, source=source)
+    return _TalibIndicator(type_name, period, source, extra)
 
 
 def load_indicator_plugin(type_: str, params_dict: dict) -> Indicator:

@@ -5,6 +5,7 @@ from typing import Any
 
 import polars as pl
 
+from tradingkit.core.timeframe import seconds_to_tf_string
 from tradingkit.core.clickhouse._sql import _validates_identifiers
 
 _OHLCV_SCHEMA = {
@@ -90,7 +91,7 @@ class _CandlesMixin:
             return pl.DataFrame(schema=_OHLCV_SCHEMA)
 
         interval = _to_ch_interval(target_seconds)
-        source_tf_str = str(source_seconds)
+        source_tf_str = seconds_to_tf_string(source_seconds)
 
         sql = f"""
             SELECT
@@ -142,10 +143,10 @@ class _CandlesMixin:
         limit: int = 10000,
         table_name: str = "candles",
     ) -> pl.DataFrame:
-        """Fetch raw stored rows (no aggregation) as Polars DataFrame."""
+        """Bars of `timeframe_seconds` as a Polars DataFrame, built from stored 1m units."""
         return await self.fetch_ohlcv_aggregated(
             exchange, symbol,
-            source_seconds=timeframe_seconds,
+            source_seconds=60,
             target_seconds=timeframe_seconds,
             start_ts=start_ts,
             end_ts=end_ts,
