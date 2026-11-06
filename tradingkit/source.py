@@ -26,6 +26,7 @@ import aiohttp
 import numpy as np
 import polars as pl
 
+from tradingkit.core.plugin_runtime import PluginRuntime
 from tradingkit.core.script_ast import resolve_params
 from tradingkit.core.timeframe import UNIT_SCALE, parse_timeframe, seconds_to_tf_string
 
@@ -79,7 +80,7 @@ DEFAULT_STREAM = "default"
 # DataSource                                                           #
 # ------------------------------------------------------------------ #
 
-class DataSource(ABC):
+class DataSource(PluginRuntime, ABC):
     """
     Base class for all data sources (exchanges, CSV files, APIs, custom feeds...).
 
@@ -106,17 +107,9 @@ class DataSource(ABC):
     streams: ClassVar[dict[str, Stream]] = {}
 
     def __init__(self, config: dict | None = None) -> None:
-        self.config = config or {}
+        super().__init__(config)
         self._request_times: list[float] = []
         self._last_request: float = 0.0
-        self._http: aiohttp.ClientSession | None = None
-        self._ready: bool = False
-
-    def __getstate__(self) -> dict:
-        state = self.__dict__.copy()
-        state["_http"] = None
-        state["_ready"] = False
-        return state
 
     # ------------------------------------------------------------------ #
     # Plugin hooks                                                         #
@@ -145,12 +138,6 @@ class DataSource(ABC):
     def has_history(self) -> bool:
         return True
 
-    async def setup(self) -> None:
-        """Runs once, before the first request or connection."""
-
-    async def close(self) -> None:
-        """Release what setup() acquired. The HTTP session is closed by the framework."""
-
     @abstractmethod
     async def history(
         self, stream: str, symbol: str, start_ts: int, end_ts: int, limit: int,
@@ -175,27 +162,6 @@ class DataSource(ABC):
     # ------------------------------------------------------------------ #
     # Framework services                                                   #
     # ------------------------------------------------------------------ #
-
-    @property
-    def session(self) -> aiohttp.ClientSession:
-        """HTTP session shared by every call on this source."""
-        if self._http is None or self._http.closed:
-            timeout = float(self.config.get("request_timeout_s", 30))
-            self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout))
-        return self._http
-
-    async def open(self) -> None:
-        if not self._ready:
-            await self.setup()
-            self._ready = True
-
-    async def shutdown(self) -> None:
-        if self._ready:
-            await self.close()
-            self._ready = False
-        if self._http is not None:
-            await self._http.close()
-            self._http = None
 
     async def get_historical_data(
         self,

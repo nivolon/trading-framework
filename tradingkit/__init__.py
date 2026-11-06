@@ -91,6 +91,9 @@ from tradingkit.pipeline import (
     PipelineResult,
 )
 
+# ── Sink ─────────────────────────────────────────────────────────────
+from tradingkit.sink import ScriptSink, Sink
+
 # ── Source ───────────────────────────────────────────────────────────
 from tradingkit.source import (
     DataSource,
@@ -132,7 +135,9 @@ __all__ = [
     "StrategyPlugin",
     # Source
     "DataSource",
+    "ScriptSink",
     "ScriptSource",
+    "Sink",
     "Stream",
     "TransientSourceError",
     # Executor

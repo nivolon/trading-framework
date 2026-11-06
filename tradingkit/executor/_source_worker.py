@@ -1,5 +1,5 @@
 """
-tradingkit.executor._source_worker — long-lived process holding one source instance.
+tradingkit.executor._source_worker — long-lived process holding one plugin instance.
 
 Speaks length-prefixed pickle over stdin/stdout with WorkerSourceSession, so the plugin
 is set up once and its state survives between calls while user code stays out of the
@@ -60,6 +60,10 @@ class _Worker:
             self._send(id=msg["id"], row=row)
         self._send(id=msg["id"], result=True)
 
+    async def _deliver(self, msg: dict) -> None:
+        await self._source.deliver(msg["event"])
+        self._send(id=msg["id"], result=True)
+
     async def _guarded(self, handler, msg: dict) -> None:
         try:
             await handler(msg)
@@ -71,7 +75,7 @@ class _Worker:
     async def run(self, reader: asyncio.StreamReader) -> None:
         handlers = {
             "init": self._init, "fetch": self._fetch,
-            "batch_gaps": self._batch_gaps, "stream": self._stream,
+            "batch_gaps": self._batch_gaps, "stream": self._stream, "deliver": self._deliver,
         }
         while True:
             try:

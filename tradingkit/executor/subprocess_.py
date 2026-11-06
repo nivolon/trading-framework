@@ -24,10 +24,11 @@ import numpy as np
 import polars as pl
 import pyarrow as pa
 
-from tradingkit.executor.base import PluginExecutor, SourceSession
+from tradingkit.executor.base import PluginExecutor, SinkSession, SourceSession
 
 if TYPE_CHECKING:
     from tradingkit.indicator import Indicator, IndicatorContext
+    from tradingkit.sink import Sink
     from tradingkit.source import DataSource
     from tradingkit.strategy import BarContext, Signal, Strategy
 
@@ -169,6 +170,10 @@ class SubprocessExecutor(PluginExecutor):
         if "error" in result:
             raise RuntimeError(result["error"])
         return result["signals"]
+
+    async def open_sink(self, sink: Sink) -> SinkSession:
+        from tradingkit.executor.source_worker import WorkerSinkSession
+        return WorkerSinkSession(sink, self._max_memory_mb)
 
     async def open_source(self, source: DataSource) -> SourceSession:
         from tradingkit.executor.source_worker import WorkerSourceSession

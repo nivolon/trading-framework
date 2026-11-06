@@ -72,6 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `on_bar_closed`.
 
 ### Added
+- **`Sink` / `ScriptSink`**, the output plugin. `send()` makes one delivery; a long-lived
+  connection opens in `setup()`. The framework retries and restores the connection, and
+  `PluginExecutor.open_sink()` runs it in its own worker under `SubprocessExecutor`.
+- A `secret` parameter type, for values a UI must not show back.
 - `Strategy.on_tick()`, optional, for every update of the forming bar in a live run.
   Signals from it carry `tick=True`. It cannot be backtested.
 - `run_strategy_script()` and `PluginExecutor.run_strategy_script()`: one way to run a

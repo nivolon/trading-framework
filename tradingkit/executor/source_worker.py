@@ -1,5 +1,5 @@
 """
-tradingkit.executor.source_worker — SourceSession backed by a long-lived process.
+tradingkit.executor.source_worker — plugin sessions backed by a long-lived process.
 
 If the process dies it is started again on the next call, and an open stream resumes.
 """
@@ -175,3 +175,9 @@ class WorkerSourceSession(SourceSession):
             await self._proc.wait()
         if self._reader is not None:
             await self._reader
+
+
+class WorkerSinkSession(WorkerSourceSession):
+    async def deliver(self, event: dict) -> None:
+        await self._ensure_started()
+        await self._request("deliver", event=event)

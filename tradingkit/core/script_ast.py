@@ -121,7 +121,7 @@ def script_params(code: str) -> dict[str, dict[str, Any]]:
     return params
 
 
-PARAM_TYPES = ("int", "float", "bool", "str", "date")
+PARAM_TYPES = ("int", "float", "bool", "str", "date", "secret")
 PARAM_SCOPES = ("connection",)
 PARAM_KEYS = (
     "type", "default", "label", "description", "required", "scope",

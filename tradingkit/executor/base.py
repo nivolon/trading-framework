@@ -12,6 +12,7 @@ import polars as pl
 if TYPE_CHECKING:
     from tradingkit.executor.cpp_pool import CppRunnerPool
     from tradingkit.indicator import Indicator, IndicatorContext
+    from tradingkit.sink import Sink
     from tradingkit.source import DataSource
     from tradingkit.strategy import BarContext, Signal, Strategy
 
@@ -51,6 +52,19 @@ class SourceSession:
 
     async def close(self) -> None:
         await self._source.shutdown()
+
+
+class SinkSession:
+    """One sink instance kept alive: its connection survives between deliveries."""
+
+    def __init__(self, sink: Sink) -> None:
+        self._sink = sink
+
+    async def deliver(self, event: dict) -> None:
+        await self._sink.deliver(event)
+
+    async def close(self) -> None:
+        await self._sink.shutdown()
 
 
 class PluginExecutor(ABC):
@@ -113,6 +127,10 @@ class PluginExecutor(ABC):
         """Run a vectorized strategy script over bars. Default: in-process."""
         from tradingkit.strategy import run_strategy_script
         return run_strategy_script(code, candles, params, name)
+
+    async def open_sink(self, sink: Sink) -> SinkSession:
+        """A long-lived handle on one sink instance. Default: in-process."""
+        return SinkSession(sink)
 
     async def open_source(self, source: DataSource) -> SourceSession:
         """A long-lived handle on one source instance. Default: in-process."""
