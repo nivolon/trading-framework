@@ -24,7 +24,7 @@ import numpy as np
 import polars as pl
 import pyarrow as pa
 
-from tradingkit.executor.base import PluginExecutor
+from tradingkit.executor.base import PluginExecutor, SourceSession
 
 if TYPE_CHECKING:
     from tradingkit.indicator import Indicator, IndicatorContext
@@ -158,6 +158,21 @@ class SubprocessExecutor(PluginExecutor):
         if "error" in result:
             raise RuntimeError(f"Subprocess source error: {result['error']}")
         return _arrow_bytes_to_df(result["data"])
+
+    async def run_strategy_script(
+        self, code: str, candles: list[dict], params: dict | None = None, name: str = "strategy",
+    ) -> list[dict]:
+        result = await self._run_in_subprocess({
+            "task": "strategy_script", "code": code, "candles": candles,
+            "params": params, "name": name,
+        })
+        if "error" in result:
+            raise RuntimeError(result["error"])
+        return result["signals"]
+
+    async def open_source(self, source: DataSource) -> SourceSession:
+        from tradingkit.executor.source_worker import WorkerSourceSession
+        return WorkerSourceSession(source, self._max_memory_mb)
 
     async def _run_in_subprocess(self, payload: dict) -> dict:
         sem = self._semaphore or asyncio.Semaphore(self._max_workers)

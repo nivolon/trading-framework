@@ -57,6 +57,27 @@ class ScriptAST:
             pass
         return False
 
+    def get_calls_dict(self, var_name: str) -> dict[str, dict[str, Any]]:
+        """Keyword arguments of each call in `var_name = {"key": Call(a=1), ...}`, read
+        without executing it. Empty if there is no such assignment."""
+        try:
+            for node in ast.walk(self._get_tree()):
+                if (
+                    isinstance(node, ast.Assign)
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == var_name
+                    and isinstance(node.value, ast.Dict)
+                ):
+                    return {
+                        ast.literal_eval(key): {
+                            kw.arg: _literal(kw.value) for kw in call.keywords
+                        }
+                        for key, call in zip(node.value.keys, node.value.values)
+                    }
+        except (SyntaxError, ValueError, AttributeError):
+            pass
+        return {}
+
     def get_literal(self, var_name: str) -> Any | None:
         """ast.literal_eval() of a `var_name = <literal>` module-level assignment, or None."""
         try:
@@ -71,6 +92,15 @@ class ScriptAST:
         except Exception:
             pass
         return None
+
+
+def _literal(node: ast.AST) -> Any:
+    """literal_eval that also accepts bare names, so {"close": float} reads as "float"."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Dict):
+        return {_literal(k): _literal(v) for k, v in zip(node.keys, node.values)}
+    return ast.literal_eval(node)
 
 
 _PARAM_TYPES = {bool: "bool", int: "int", float: "float", str: "str"}
@@ -89,6 +119,29 @@ def script_params(code: str) -> dict[str, dict[str, Any]]:
         entry.setdefault("type", _PARAM_TYPES.get(type(entry.get("default")), "str"))
         params[name] = entry
     return params
+
+
+PARAM_TYPES = ("int", "float", "bool", "str", "date")
+PARAM_SCOPES = ("connection",)
+PARAM_KEYS = (
+    "type", "default", "label", "description", "required", "scope",
+    "options", "min", "max", "step",
+)
+
+
+def param_problems(code: str) -> list[str]:
+    """Mistakes in a script's __params__. A misspelled key or scope would otherwise be
+    ignored, and the field would quietly end up somewhere else in the form."""
+    problems: list[str] = []
+    for name, spec in script_params(code).items():
+        for key in spec:
+            if key not in PARAM_KEYS:
+                problems.append(f"{name}: unknown key {key!r}. Valid keys: {', '.join(PARAM_KEYS)}")
+        if spec["type"] not in PARAM_TYPES:
+            problems.append(f"{name}: unknown type {spec['type']!r}. Valid types: {', '.join(PARAM_TYPES)}")
+        if "scope" in spec and spec["scope"] not in PARAM_SCOPES:
+            problems.append(f"{name}: unknown scope {spec['scope']!r}. Valid scopes: {', '.join(PARAM_SCOPES)}")
+    return problems
 
 
 def _cast_param(name: str, value: Any, spec: dict[str, Any]) -> Any:
@@ -134,4 +187,4 @@ def resolve_params(code: str, overrides: dict[str, Any] | None = None) -> dict[s
     return values
 
 
-__all__ = ["ScriptAST", "resolve_params", "script_params"]
+__all__ = ["ScriptAST", "param_problems", "resolve_params", "script_params"]

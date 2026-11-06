@@ -5,7 +5,7 @@ from typing import Any
 
 import polars as pl
 
-from tradingkit.core.timeframe import seconds_to_tf_string
+from tradingkit.core.timeframe import parse_timeframe, seconds_to_tf_string
 from tradingkit.core.clickhouse._sql import _validates_identifiers
 
 _OHLCV_SCHEMA = {
@@ -103,7 +103,7 @@ class _CandlesMixin:
                 min(low)                 AS low,
                 argMax(close, timestamp) AS close,
                 sum(volume)              AS volume
-            FROM {table_name}
+            FROM {table_name} FINAL
             WHERE exchange  = %(ex)s
               AND symbol    = %(sym)s
               AND timeframe = %(tf)s
@@ -152,6 +152,39 @@ class _CandlesMixin:
             end_ts=end_ts,
             limit=limit,
             table_name=table_name,
+        )
+
+    async def count_closed_bars(
+        self, exchange: str, symbol: str, timeframe_seconds: int, before_ts: int,
+    ) -> int:
+        """Bars of a timeframe that stored 1m units can fill, up to the forming bar."""
+        seconds = int(timeframe_seconds)
+        rows = await self._execute(
+            f"SELECT uniqExact(intDiv(timestamp, {seconds})) FROM candles FINAL"
+            " WHERE exchange = %(ex)s AND symbol = %(sym)s AND timeframe = '1m'"
+            " AND timestamp < %(before)s",
+            {"ex": exchange, "sym": symbol, "before": before_ts},
+        )
+        return int(rows[0][0]) if rows else 0
+
+    async def invalidate_derived(self, exchange: str, symbol: str, start_ts: int) -> None:
+        """Drop aggregated bars and indicator values built before `start_ts` was filled."""
+        where = "exchange = %(ex)s AND symbol = %(sym)s"
+        params = {"ex": exchange, "sym": symbol, "st": start_ts}
+        rows = await self._execute(
+            f"SELECT DISTINCT timeframe FROM candles WHERE {where} AND timeframe != '1m'", params,
+        )
+        for (timeframe,) in rows:
+            bar_start = start_ts - start_ts % parse_timeframe(timeframe)
+            await self._execute(
+                f"ALTER TABLE candles DELETE WHERE {where} AND timeframe = %(tf)s"
+                " AND timestamp >= %(bar)s SETTINGS mutations_sync = 1",
+                {**params, "tf": timeframe, "bar": bar_start},
+            )
+        await self._execute(
+            f"ALTER TABLE indicators DELETE WHERE {where} AND timestamp >= %(st)s"
+            " SETTINGS mutations_sync = 1",
+            params,
         )
 
     @_validates_identifiers("table_name")

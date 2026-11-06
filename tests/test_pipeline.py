@@ -12,6 +12,7 @@ import pytest
 from tradingkit.indicator import ScriptIndicator
 from tradingkit.pipeline import Pipeline, PipelineResult, _gap_rows, _merge_rows
 from tradingkit.runner._safe_pickle import UnsafeUnpicklingError
+from tests._fixtures.sources import frame_script
 from tradingkit.source import DataSource, ScriptSource
 from tradingkit.strategy import ScriptStrategy, Signal
 
@@ -19,7 +20,7 @@ from tradingkit.strategy import ScriptStrategy, Signal
 def _make_pipeline() -> Pipeline:
     return Pipeline(
         name="test_pipeline",
-        source=ScriptSource(code="result = pl.DataFrame({'timestamp':[1],'close':[1.0]})"),
+        source=ScriptSource(code=frame_script("{'timestamp': [1], 'close': [1.0]}")),
         indicators={"rsi": ScriptIndicator(code="result = close", period=14)},
         strategy=ScriptStrategy(code="def get_required_indicators(config): return ['rsi']"),
     )
@@ -56,7 +57,7 @@ def test_from_dict_uses_restricted_unpickler_for_indicators_and_strategy():
         def __reduce__(self):
             return (os.system, ("echo pwned",))
 
-    good_source = base64.b64encode(pickle.dumps(ScriptSource(code="result = None"))).decode()
+    good_source = base64.b64encode(pickle.dumps(ScriptSource(code=frame_script("{'timestamp': [1]}")))).decode()
     for field in ("indicators", "strategy"):
         d = {
             "name": "evil",
@@ -76,11 +77,12 @@ async def test_pipeline_run_end_to_end():
     p = Pipeline(
         name="rsi_pipeline",
         source=ScriptSource(code="""
-import numpy as np
-n = 60
-close = 100 + np.cumsum(np.random.default_rng(0).normal(0, 1, n))
-result = pl.DataFrame({"timestamp": np.arange(n) * 60, "open": close, "high": close + 1,
-                        "low": close - 1, "close": close, "volume": np.ones(n)})
+class Random(DataSource):
+    async def history(self, stream, symbol, start_ts, end_ts, limit):
+        n = 60
+        close = 100 + np.cumsum(np.random.default_rng(0).normal(0, 1, n))
+        return pl.DataFrame({"timestamp": np.arange(n) * 60, "open": close, "high": close + 1,
+                             "low": close - 1, "close": close, "volume": np.ones(n)})
 """),
         indicators={"rsi": ScriptIndicator(code="result = ta.rsi(close, 14)", period=14)},
         strategy=ScriptStrategy(code="""
@@ -136,7 +138,7 @@ class GappySource(DataSource):
         self.missing = missing or []
         self.fetch_gap_calls: list[tuple[int, int]] = []
 
-    async def get_historical_data(self, symbol, timeframe, start_ts, end_ts, limit=5000):
+    async def history(self, stream, symbol, start_ts, end_ts, limit):
         return pl.DataFrame(self.rows)
 
     async def fetch_gap(self, symbol, timeframe, start_ts, end_ts):
@@ -263,8 +265,8 @@ async def test_run_live_deduplicates_a_backfilled_bar_that_also_arrives_live():
 
     signals = [s async for s in p.run_live("BTC", 60)]
 
-    assert [s.timestamp for s in signals] == [0, 60, 120, 120]
-    assert [s.price for s in signals] == [1.0, 2.0, 3.0, 3.5]
+    assert [s.timestamp for s in signals] == [0, 60, 120]
+    assert [s.price for s in signals] == [1.0, 2.0, 3.0]
 
 
 async def test_run_live_survives_a_failing_strategy():
@@ -289,3 +291,111 @@ async def test_run_live_survives_a_failing_indicator():
     )
     signals = [s async for s in p.run_live("BTC", 60)]
     assert [s.timestamp for s in signals] == [0, 60]
+
+
+# ------------------------------------------------------------------ #
+# Live equals backtest                                                 #
+# ------------------------------------------------------------------ #
+
+class TickingSource(DataSource):
+    """Streams every bar as several updates, ending on a value the exchange then corrects:
+    what a live connection looks like. history() is the exchange's final record."""
+
+    def __init__(self, rows: list[dict], official: bool = True):
+        super().__init__({"bar_close_delay_s": 0})
+        self.rows = rows
+        self.official = official
+
+    async def history(self, stream, symbol, start_ts, end_ts, limit):
+        if not self.official:
+            raise KeyError("no record")
+        return pl.DataFrame([r for r in self.rows if start_ts <= r["timestamp"] <= end_ts])
+
+    async def stream(self, symbol, timeframe, on_event=None, stream=None):
+        for row in self.rows:
+            yield {**row, "close": 10_000.0}
+            yield {**row, "close": row["close"] + 1}
+
+
+def _crossing_pipeline(source):
+    return Pipeline(
+        name="parity",
+        source=source,
+        indicators={},
+        strategy=ScriptStrategy(code="""
+if bar.close > 2.5:
+    signal = Signal(action="long", price=bar.close)
+"""),
+    )
+
+
+async def test_a_live_run_produces_the_same_signals_as_a_backtest():
+    rows = [_bar(60 * i, float(i)) for i in range(6)]
+    backtest = await _crossing_pipeline(TickingSource(rows)).run("BTC", 60, 0, 300)
+    live = [s async for s in _crossing_pipeline(TickingSource(rows)).run_live("BTC", 60)]
+    fields = lambda s: {k: v for k, v in s.to_dict().items() if k != "gap_recovered"}  # noqa: E731
+    assert [fields(s) for s in live] == [fields(s) for s in backtest.signals]
+    assert len(live) == 3
+
+
+async def test_each_bar_gives_one_signal_however_many_updates_it_had():
+    rows = [_bar(60 * i, 5.0) for i in range(3)]
+    live = [s async for s in _crossing_pipeline(TickingSource(rows)).run_live("BTC", 60)]
+    assert [s.timestamp for s in live] == [0, 60, 120]
+
+
+async def test_a_bar_without_an_official_record_is_flagged_provisional():
+    rows = [_bar(0, 5.0)]
+    source = TickingSource(rows, official=False)
+    live = [s async for s in _crossing_pipeline(source).run_live("BTC", 60)]
+    assert live[0].provisional is True
+    assert live[0].price == 6.0
+
+
+async def test_on_tick_sees_every_update_and_is_flagged():
+    source = TickingSource([_bar(0, 1.0)])
+    pipeline = Pipeline(
+        name="ticks", source=source, indicators={},
+        strategy=ScriptStrategy(code="""
+async def on_tick(update):
+    return {"action": "tick", "close": update["close"]}
+"""),
+    )
+    signals = [s async for s in pipeline.run_live("BTC", 60)]
+    assert [s.close for s in signals] == [10_000.0, 2.0]
+    assert all(s.tick is True for s in signals)
+
+
+async def test_on_tick_is_not_called_in_a_backtest():
+    pipeline = Pipeline(
+        name="ticks", source=TickingSource([_bar(0, 1.0)]), indicators={},
+        strategy=ScriptStrategy(code="""
+async def on_tick(update):
+    return {"action": "tick"}
+"""),
+    )
+    assert (await pipeline.run("BTC", 60, 0, 60)).signals == []
+
+
+async def test_indicators_are_warmed_up_from_history():
+    import time
+
+    now = int(time.time())
+    end = now - now % 60 - 60
+    rows = [_bar(end - 60 * i, 100.0 + i % 7) for i in range(40, 0, -1)]
+    live_row = _bar(end, 110.0)
+
+    class Warm(TickingSource):
+        async def stream(self, symbol, timeframe, on_event=None, stream=None):
+            yield live_row
+
+    source = Warm(rows)
+    pipeline = Pipeline(
+        name="warm", source=source,
+        indicators={"rsi": ScriptIndicator(code="result = ta.rsi(close, 14)", period=14)},
+        strategy=ScriptStrategy(code="""
+signal = Signal(rsi=bar.rsi)
+"""),
+    )
+    signals = [s async for s in pipeline.run_live("BTC", 60)]
+    assert not math.isnan(signals[0].rsi)

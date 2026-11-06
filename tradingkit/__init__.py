@@ -95,6 +95,8 @@ from tradingkit.pipeline import (
 from tradingkit.source import (
     DataSource,
     ScriptSource,
+    Stream,
+    TransientSourceError,
 )
 
 # ── Strategy ─────────────────────────────────────────────────────────
@@ -131,6 +133,8 @@ __all__ = [
     # Source
     "DataSource",
     "ScriptSource",
+    "Stream",
+    "TransientSourceError",
     # Executor
     "PluginExecutor",
     "LocalExecutor",

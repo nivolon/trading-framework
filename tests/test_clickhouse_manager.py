@@ -52,6 +52,32 @@ async def test_fetch_data_df_aggregates_from_stored_1m_labels(fake_ch_http):
     assert "INTERVAL 7 MINUTE" in sql
 
 
+async def test_invalidate_derived_keeps_stored_minute_units(fake_ch_http):
+    fake_ch_http._responses.append(FakeChResponse(json_data={"data": [["15m"]]}))
+    fake_ch_http._responses.append(FakeChResponse(json_data={"data": []}))
+    fake_ch_http._responses.append(FakeChResponse(json_data={"data": []}))
+    db = ClickHouseManager()
+    db._conn = object()
+
+    await db.invalidate_derived("whitebit", "BTC_USDT", 1000)
+    statements = [call["body"] for call in fake_ch_http.calls]
+    assert "timeframe != '1m'" in statements[0]
+    assert "timeframe = '15m'" in statements[1] and "timestamp >= 900" in statements[1]
+    assert "ALTER TABLE indicators DELETE" in statements[2]
+
+
+async def test_ensure_raw_table_engine_follows_the_update_mode(fake_ch_http):
+    for _ in range(4):
+        fake_ch_http._responses.append(FakeChResponse(json_data={"data": []}))
+    db = ClickHouseManager()
+    db._conn = object()
+
+    await db.ensure_raw_table("candles", {"timestamp": pl.Int64})
+    assert "ENGINE = ReplacingMergeTree" in _sql(fake_ch_http, 0)
+    await db.ensure_raw_table("trades", {"timestamp": pl.Int64}, "append")
+    assert "ENGINE = MergeTree" in _sql(fake_ch_http, 2)
+
+
 async def test_fetch_data_parses_rows_into_dicts(fake_ch_http):
     fake_ch_http._responses.append(FakeChResponse(json_data={
         "data": [[1000, 1.0, 2.0, 0.5, 1.5, 10.0]],

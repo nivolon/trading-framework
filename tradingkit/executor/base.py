@@ -4,6 +4,7 @@ tradingkit.executor.base — PluginExecutor ABC.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Self
 
 import polars as pl
@@ -13,6 +14,43 @@ if TYPE_CHECKING:
     from tradingkit.indicator import Indicator, IndicatorContext
     from tradingkit.source import DataSource
     from tradingkit.strategy import BarContext, Signal, Strategy
+
+
+class SourceSession:
+    """One source instance kept alive for a connection: it is set up once and its HTTP
+    session and state survive between calls."""
+
+    def __init__(self, source: DataSource) -> None:
+        self._source = source
+
+    async def fetch(
+        self,
+        symbol: str,
+        timeframe: int,
+        start_ts: int,
+        end_ts: int,
+        limit: int = 5000,
+        stream: str | None = None,
+    ) -> pl.DataFrame:
+        return await self._source.get_historical_data(
+            symbol, timeframe, start_ts, end_ts, limit, stream,
+        )
+
+    async def stream(
+        self,
+        symbol: str,
+        timeframe: int,
+        on_event: Callable[[dict], None] | None = None,
+        stream: str | None = None,
+    ) -> AsyncIterator[dict]:
+        async for row in self._source.stream(symbol, timeframe, on_event, stream):
+            yield row
+
+    async def batch_gaps(self, gaps: list[dict]) -> list[dict]:
+        return self._source.batch_gaps(gaps)
+
+    async def close(self) -> None:
+        await self._source.shutdown()
 
 
 class PluginExecutor(ABC):
@@ -68,6 +106,17 @@ class PluginExecutor(ABC):
         Call source.get_historical_data() and return pl.DataFrame.
         """
         ...
+
+    async def run_strategy_script(
+        self, code: str, candles: list[dict], params: dict | None = None, name: str = "strategy",
+    ) -> list[dict]:
+        """Run a vectorized strategy script over bars. Default: in-process."""
+        from tradingkit.strategy import run_strategy_script
+        return run_strategy_script(code, candles, params, name)
+
+    async def open_source(self, source: DataSource) -> SourceSession:
+        """A long-lived handle on one source instance. Default: in-process."""
+        return SourceSession(source)
 
     async def start(self) -> None:
         """Optional: initialize executor resources (subprocesses, connections...)."""

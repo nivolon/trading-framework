@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from tradingkit.core.script_ast import resolve_params, script_params
+from tradingkit.core.script_ast import param_problems, resolve_params, script_params
 from tradingkit.indicator import _extract_defaults
 
 NESTED = '''
@@ -14,6 +14,23 @@ __params__ = {
     "enabled": {"type": "bool",  "default": True},
 }
 '''
+
+
+def test_a_valid_declaration_has_no_problems():
+    assert param_problems(NESTED) == []
+    assert param_problems('__params__ = {"s": {"type": "date", "scope": "connection"}}') == []
+
+
+@pytest.mark.parametrize("spec, expected", [
+    ('{"type": "str", "scope": "conection"}', "unknown scope"),
+    ('{"type": "text"}', "unknown type"),
+    ('{"type": "str", "lable": "x"}', "unknown key"),
+])
+def test_mistakes_are_named_with_what_is_valid(spec, expected):
+    problems = param_problems(f'__params__ = {{"field": {spec}}}')
+    assert len(problems) == 1
+    assert problems[0].startswith("field:") and expected in problems[0]
+    assert "Valid" in problems[0]
 
 
 def test_nested_declaration_yields_every_default():

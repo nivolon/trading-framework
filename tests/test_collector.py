@@ -8,6 +8,8 @@ import polars as pl
 import pytest
 
 from tradingkit.collector import DataCollector, _ConnectionWorker
+from tradingkit.core.timeframe import UNIT_SCALE
+from tradingkit.executor.base import SourceSession
 from tradingkit.source import ScriptSource
 
 # ------------------------------------------------------------------ #
@@ -30,7 +32,11 @@ class FakeSource(ScriptSource):
 
     def __init__(self, config: dict | None = None, timestamp_unit: str = "s"):
         super().__init__(
-            code="TABLE_NAME = 'unit_test'\nasync def historical(*a): return []",
+            code=(
+                "class S(DataSource):\n"
+                "    streams = {'unit': Stream(table='unit_test', step=step)}\n"
+                "    async def history(self, *a): return []\n"
+            ).replace("step=step", f"step={60 * UNIT_SCALE[timestamp_unit]}"),
             config=config,
         )
         self._unit = timestamp_unit
@@ -44,39 +50,54 @@ class FakeSource(ScriptSource):
         self.calls.append("batch_gaps")
         return super().batch_gaps(gaps)
 
-    async def rate_limit(self) -> None:
-        self.calls.append("rate_limit")
-
-    async def get_historical_data(self, symbol, timeframe, start_ts, end_ts, limit=5000):
+    async def get_historical_data(self, symbol, timeframe, start_ts, end_ts, limit=5000, stream=None):
         self.calls.append("get_historical_data")
         return pl.DataFrame({"timestamp": [start_ts], "close": [1.0]})
 
 
+class RecordingSession(SourceSession):
+    def __init__(self, source, calls):
+        super().__init__(source)
+        self.calls = calls
+
+    async def fetch(self, symbol, timeframe, start_ts, end_ts, limit=5000, stream=None):
+        self.calls.append((symbol, timeframe, start_ts, end_ts))
+        return await super().fetch(symbol, timeframe, start_ts, end_ts, limit, stream)
+
+
 class FakeExecutor:
     """Stands in for LocalExecutor/SubprocessExecutor — records that the worker fetches
-    *through* the executor rather than calling the source script directly."""
+    through its session rather than calling the source directly."""
 
     def __init__(self):
         self.calls: list[tuple] = []
+        self.opened = 0
 
-    async def fetch_source_data(self, source, symbol, timeframe, start_ts, end_ts, limit=5000):
-        self.calls.append((symbol, timeframe, start_ts, end_ts))
-        return await source.get_historical_data(symbol, timeframe, start_ts, end_ts, limit)
+    async def open_source(self, source):
+        self.opened += 1
+        return RecordingSession(source, self.calls)
 
 
 class FakeDb:
     def __init__(self):
         self.unit_range = (None, None)
+        self.stored_rows = 0
         self.gaps = []
         self.inserted: list[pl.DataFrame] = []
 
-    async def get_unit_range(self, table, exchange, symbol):
+    async def get_unit_range(self, table, exchange, symbol, timeframe):
         return self.unit_range
 
-    async def find_unit_gaps(self, table, exchange, symbol, start_ts, end_ts, unit_interval_s=60):
+    async def find_unit_gaps(self, table, exchange, symbol, timeframe, start_ts, end_ts, unit_interval_s=60):
         return self.gaps
 
-    async def ensure_raw_table(self, table, schema):
+    async def count_unit_rows(self, table, exchange, symbol, timeframe, start_ts, end_ts):
+        return self.stored_rows
+
+    async def invalidate_derived(self, exchange, symbol, start_ts):
+        pass
+
+    async def ensure_raw_table(self, table, schema, updates="replace"):
         pass
 
     async def insert_unit_batch(self, table, df, exchange, symbol, timeframe):
@@ -138,16 +159,25 @@ async def test_fetch_and_store_goes_through_the_executor():
     assert len(db.inserted) == 1
 
 
-async def test_fetch_and_store_rate_limits_through_the_source():
-    """Rate limits belong to the exchange, so the worker asks the source rather than
-    keeping its own throttling state."""
-    source = FakeSource()
-    worker = _ConnectionWorker(
-        _make_conn(), db=FakeDb(), source=source, executor=FakeExecutor(),
-    )
+async def test_one_session_serves_every_fetch():
+    source, db = FakeSource(), FakeDb()
+    worker = _ConnectionWorker(_make_conn(), db=db, source=source, executor=FakeExecutor())
     await worker._fetch_and_store(0, 600, 1, 1)
-    assert "rate_limit" in source.calls
-    assert source.calls.index("rate_limit") < source.calls.index("get_historical_data")
+    await worker._fetch_and_store(600, 1200, 1, 1)
+    assert worker._executor.opened == 1
+
+
+def test_stream_events_drive_the_connection_status():
+    worker = _make_worker()
+    worker._on_stream_event({"event": "reconnecting", "error": "reset"})
+    assert worker.progress["status"] == "reconnecting"
+    assert worker.progress["error"] == "reset"
+    assert not worker._gap_wake.is_set()
+
+    worker._on_stream_event({"event": "connected"})
+    assert worker.progress["status"] == "streaming"
+    assert worker.progress["error"] is None
+    assert worker._gap_wake.is_set()
 
 
 async def test_recover_gaps_batches_through_the_source():
@@ -244,9 +274,15 @@ async def test_detect_gaps_swallows_db_errors():
     assert gaps == []
 
 
-async def test_batch_complete_true_when_range_covers_window(worker):
-    worker._db.unit_range = (0, 900)
-    assert await worker._batch_complete(0, 800) is True
+async def test_batch_is_complete_when_every_row_is_stored(worker):
+    worker._db.stored_rows = 11
+    assert await worker._batch_complete(0, 600) is True
+
+
+async def test_gap_inside_stored_data_is_not_complete(worker):
+    worker._db.unit_range = (0, 6000)
+    worker._db.stored_rows = 8
+    assert await worker._batch_complete(0, 600) is False
 
 
 async def test_batch_complete_false_when_no_data(worker):
@@ -254,10 +290,59 @@ async def test_batch_complete_false_when_no_data(worker):
     assert await worker._batch_complete(0, 800) is False
 
 
-def test_table_name_from_source_table_name():
-    conn = _make_conn()
-    source = ScriptSource(code="TABLE_NAME = 'funding_rates'")
-    w = _ConnectionWorker(conn, db=FakeDb(), source=source)
+async def test_official_bar_replaces_the_streamed_one():
+    source, db = FakeSource(), FakeDb()
+    worker = _ConnectionWorker(_make_conn(), db=db, source=source, executor=FakeExecutor())
+    assert await worker._store_official_bar(600) is True
+    assert worker._executor.calls == [("BTC_USDT", 60, 600, 600)]
+    assert len(db.inserted) == 1
+
+
+async def test_a_missing_official_bar_is_reported_not_raised():
+    class Failing(FakeSource):
+        async def get_historical_data(self, *a, **kw):
+            raise RuntimeError("down")
+
+    worker = _ConnectionWorker(_make_conn(), db=FakeDb(), source=Failing(), executor=FakeExecutor())
+    assert await worker._store_official_bar(600) is False
+
+
+async def test_a_connection_without_a_start_date_collects_no_history():
+    source = ScriptSource(code=(
+        "class S(DataSource):\n"
+        "    streams = {'news': Stream(table='news', history=False)}\n"
+        "    async def history(self, *a): return []\n"
+        "    async def live(self, stream, symbol):\n"
+        "        return\n"
+        "        yield {}\n"
+    ))
+    conn = {"name": "news", "source": "news.py", "config": "{}"}
+    worker = _ConnectionWorker(conn, db=FakeDb(), source=source, executor=FakeExecutor())
+    assert worker._symbol == "" and worker._start_date is None
+
+
+def test_table_comes_from_the_stream():
+    source = ScriptSource(code=(
+        "class S(DataSource):\n"
+        "    streams = {'funding': Stream(table='funding_rates', step=28800)}\n"
+        "    async def history(self, *a): return []\n"
+    ))
+    w = _ConnectionWorker(_make_conn(), db=FakeDb(), source=source)
+    assert w._table == "funding_rates"
+    assert w._unit_interval == 28800
+    assert w._timeframe == "8h"
+
+
+def test_connection_config_selects_the_stream():
+    source = ScriptSource(code=(
+        "class S(DataSource):\n"
+        "    streams = {\n"
+        "        'candles': Stream(table='candles', step=60),\n"
+        "        'funding': Stream(table='funding_rates', step=28800),\n"
+        "    }\n"
+        "    async def history(self, *a): return []\n"
+    ))
+    w = _ConnectionWorker(_make_conn(config='{"stream": "funding"}'), db=FakeDb(), source=source)
     assert w._table == "funding_rates"
 
 

@@ -197,15 +197,10 @@ class DependencyResolver:
         now_ts = int(_time.time())
         current_bar_start = (now_ts // tf_seconds) * tf_seconds
 
-        raw_count = await self.db.count_rows(exchange, symbol, "1m")
-        existing  = await self.db.count_rows(exchange, symbol, timeframe)
-        expected  = max(1, (raw_count * 60 - tf_seconds) // tf_seconds)
-
-        if existing >= int(expected * _CACHE_FRESH_RATIO):
-            _, max_cached_ts = await self.db.get_data_range(exchange, symbol, timeframe)
-            last_closed_bar  = current_bar_start - tf_seconds
-            if max_cached_ts and max_cached_ts >= last_closed_bar:
-                return
+        existing = await self.db.count_rows(exchange, symbol, timeframe)
+        closed   = await self.db.count_closed_bars(exchange, symbol, tf_seconds, current_bar_start)
+        if closed and existing >= closed:
+            return
 
         if progress_cb:
             await progress_cb({"stage": "aggregating", "timeframe": timeframe})
@@ -237,7 +232,7 @@ class DependencyResolver:
                 min(c.low)                     AS low,
                 argMax(c.close, c.timestamp)   AS close,
                 sum(c.volume)                  AS volume
-            FROM candles AS c
+            FROM candles AS c FINAL
             WHERE c.exchange  = %(ex)s
               AND c.symbol    = %(sym)s
               AND c.timeframe = %(src)s

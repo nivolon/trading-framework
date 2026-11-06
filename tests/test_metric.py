@@ -140,14 +140,14 @@ def test_result_metrics_default_to_empty():
 async def test_pipeline_computes_declared_metrics():
     """Declared like indicators: Pipeline(metrics={...}) -> result.metrics."""
     from tradingkit.pipeline import Pipeline
+    from tests._fixtures.sources import frame_script
     from tradingkit.source import ScriptSource
     from tradingkit.strategy import ScriptStrategy
 
     p = Pipeline(
         name="m",
-        source=ScriptSource(code=(
-            'result = pl.DataFrame({"timestamp": [0, 60, 120], '
-            '"close": [10.0, 11.0, 12.0]})'
+        source=ScriptSource(code=frame_script(
+            '{"timestamp": [0, 60, 120], "close": [10.0, 11.0, 12.0]}'
         )),
         indicators={},
         strategy=ScriptStrategy(code='signal = Signal(action="open_long", price=bar.close)'),
@@ -161,12 +161,13 @@ async def test_pipeline_metric_failure_does_not_discard_the_run():
     """A metric asking for a column these signals don't have reports None -- losing the
     whole backtest over one misconfigured metric would be worse than losing the metric."""
     from tradingkit.pipeline import Pipeline
+    from tests._fixtures.sources import frame_script
     from tradingkit.source import ScriptSource
     from tradingkit.strategy import ScriptStrategy
 
     p = Pipeline(
         name="m",
-        source=ScriptSource(code='result = pl.DataFrame({"timestamp": [0], "close": [1.0]})'),
+        source=ScriptSource(code=frame_script('{"timestamp": [0], "close": [1.0]}')),
         indicators={},
         strategy=ScriptStrategy(code='signal = Signal(action="x")'),
         metrics={"boom": ScriptMetric(code="result = signals['nope'].sum()")},

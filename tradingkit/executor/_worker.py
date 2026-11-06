@@ -46,6 +46,13 @@ async def _run_strategy(payload: dict) -> dict:
     return {"signal": signal.to_dict() if signal is not None else None}
 
 
+async def _run_strategy_script(payload: dict) -> dict:
+    from tradingkit.strategy import run_strategy_script
+    return {"signals": run_strategy_script(
+        payload["code"], payload["candles"], payload["params"], payload["name"],
+    )}
+
+
 async def _run_source(payload: dict) -> dict:
     import polars as pl
     import pyarrow as pa
@@ -86,6 +93,8 @@ async def main() -> None:
             result = await _run_indicator(payload)
         elif task == "strategy":
             result = await _run_strategy(payload)
+        elif task == "strategy_script":
+            result = await _run_strategy_script(payload)
         elif task == "source":
             result = await _run_source(payload)
         else:

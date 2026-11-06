@@ -14,6 +14,70 @@ import polars as pl
 from tradingkit.indicator import Indicator, IndicatorDeclaration
 
 # ------------------------------------------------------------------ #
+# Strategy scripts over a window of bars                               #
+# ------------------------------------------------------------------ #
+
+def run_strategy_script(
+    code: str, candles: list[dict], params: dict | None = None, name: str = "strategy",
+) -> list[dict]:
+    """
+    Run a vectorized strategy script over closed bars and return its signals.
+
+    The script sees close, high, low, open, volume and ts as numpy arrays, plus ta, np,
+    Signal, and its __params__ values. It appends to `signals`, or assigns `result` an
+    array where 1 means buy, -1 means sell and 0 means hold.
+
+    A backtest and a live run both come through here, so they cannot disagree.
+    """
+    import numpy as np
+
+    from tradingkit.core.script_ast import resolve_params
+    from tradingkit.indicator import _ta_ns
+
+    column = lambda key: np.array([float(c[key]) for c in candles], dtype=np.float64)  # noqa: E731
+    close = column("close")
+    ts = np.array([int(c["timestamp"]) for c in candles], dtype=np.int64)
+    signals: list[dict] = []
+    namespace: dict[str, Any] = {
+        "close": close, "high": column("high"), "low": column("low"),
+        "open": column("open"), "volume": column("volume"), "ts": ts,
+        "ta": _ta_ns, "np": np, "Signal": Signal, "signals": signals, "result": None,
+        **resolve_params(code, params),
+    }
+    exec(compile(code, "<strategy_script>", "exec"), namespace)  # noqa: S102
+
+    def record(timestamp: int, signal_type: Any, confidence: float, price: float, meta: dict) -> dict:
+        return {
+            "timestamp": timestamp, "signal_type": str(signal_type), "confidence": confidence,
+            "price": price, "strategy_name": name, "metadata": meta,
+        }
+
+    if signals:
+        def price_at(signal: dict) -> float:
+            if "price" in signal:
+                return float(signal["price"])
+            return float(close[min(int(np.searchsorted(ts, signal.get("timestamp", 0))), len(close) - 1)])
+
+        return [
+            record(int(s.get("timestamp", 0)), s.get("signal_type", "?"),
+                   float(s.get("confidence", 0.8)), price_at(s),
+                   s.get("metadata", s.get("meta", {})))
+            for s in signals
+        ]
+
+    if namespace.get("result") is None:
+        return []
+    values = np.asarray(namespace["result"])
+    return [
+        record(int(ts[i]), "buy" if value > 0 else "sell",
+               0.8 if abs(float(value)) == 1 else min(abs(float(value)), 1.0),
+               float(close[i]), {})
+        for i, value in enumerate(values)
+        if float(value) != 0 and not np.isnan(float(value))
+    ]
+
+
+# ------------------------------------------------------------------ #
 # Signal                                                               #
 # ------------------------------------------------------------------ #
 
@@ -193,6 +257,16 @@ class Strategy(ABC):
         (nothing to emit). The fields are yours to choose — see Signal."""
         ...
 
+
+    async def on_tick(self, update: dict) -> Signal | dict | None:
+        """Optional: every update of the forming bar during a live run. Never called in a
+        backtest, because history has no forming bars, so what happens here cannot be
+        backtested."""
+        return None
+
+    def has_on_tick(self) -> bool:
+        return type(self).on_tick is not Strategy.on_tick
+
     @classmethod
     def required_indicators(cls) -> dict[str, IndicatorDeclaration | Indicator]:
         """
@@ -316,6 +390,13 @@ class ScriptStrategy(Strategy):
         raise TypeError(
             f"Strategy code must assign a Signal or dict to 'signal', got {type(result)}"
         )
+
+    def has_on_tick(self) -> bool:
+        return "on_tick" in self._ns
+
+    async def on_tick(self, update: dict) -> Signal | dict | None:
+        fn = self._ns.get("on_tick")
+        return await fn(update) if fn else None
 
     def get_required_indicators(self, params: Any = None) -> list:
         fn = self._ns.get("get_required_indicators")

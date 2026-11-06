@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and polled tables that did not exist. Builtins remain available as templates.
 
 ### Fixed
+- **Gap recovery never filled a gap inside stored data.** `_batch_complete()` treated any
+  range between the oldest and newest row as complete, so a detected gap was skipped
+  without fetching. It now counts the rows actually stored.
+- **Gap detection mixed timeframes.** Aggregated bars share the `candles` table and hid
+  parts of a gap; `get_unit_range()` and `find_unit_gaps()` now filter on the timeframe.
+- **Bars and indicators stayed stale after a recovered gap.** Filling a gap now drops the
+  derived data from that point, and aggregation counts the closed bars exactly instead of
+  estimating. Aggregation also reads `FINAL`, so a forming bar's volume is not summed twice.
 - **Custom timeframes were treated as one minute.** `DependencyResolver` looked timeframes
   up in a fixed table with a 60s fallback, so `7m` computed warmup and bucketing as `1m`.
   It now uses `parse_timeframe()`.
@@ -34,7 +42,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **TA-Lib indicators could not run under `SubprocessExecutor`.** The class was defined
   inside a function, so it could not be pickled.
 
+### Changed
+- **Breaking: sources are classes only, with a new contract.** A source implements
+  `history()` for one request and `live()` for one connection; `setup()` and `close()` are
+  optional and run once. The framework now owns the HTTP session (`self.session`), retries
+  (`max_retries`, `retry_delay_s`), rate limits, the reconnect loop (`reconnect_delay_s`,
+  `max_reconnect_delay_s`) and treating a silent connection as dead (`stale_timeout_s`).
+  The `historical()`/`realtime()` function style and the `result =` expression style are
+  gone, as is overriding `get_historical_data()` and `stream()`.
+- **`PluginExecutor.open_source()`** returns a `SourceSession`. Under `SubprocessExecutor`
+  it is a long-lived worker process per connection: the plugin is set up once, streaming
+  is isolated for the first time, and a dead worker is restarted.
+- **Sources describe their data as named `Stream`s** (`table`, `columns`, `step`, `updates`,
+  `history`) instead of `TABLE_NAME`. Behaviour follows from these properties: `step` enables
+  gap recovery, `updates` picks replacing or appending storage. A connection selects one
+  stream with `config["stream"]`, defaulting to the first declared.
+- `ScriptSource` no longer executes a script to answer questions about it: table name,
+  timestamp unit and capabilities are read from the source text.
+- `DataCollector` no longer requires a symbol or a start date. A connection without a start
+  date collects live data only, with no backfill or gap recovery.
+- `DataCollector` reports `reconnecting` with the reason, and runs gap recovery as soon as
+  a stream reconnects rather than at the next interval.
+
+- **Live runs see what a backtest sees.** `Pipeline.run_live()` used to call strategies on
+  every update of the forming bar and started with no history. Bars now close by the clock
+  (end plus `bar_close_delay_s`) from the exchange's own record, with `provisional=True` on
+  signals when that record can't be had, and indicators are warmed up first.
+- `DataCollector` closes bars the same way, storing the official bar and calling
+  `on_bar_closed`.
+
 ### Added
+- `Strategy.on_tick()`, optional, for every update of the forming bar in a live run.
+  Signals from it carry `tick=True`. It cannot be backtested.
+- `run_strategy_script()` and `PluginExecutor.run_strategy_script()`: one way to run a
+  vectorized strategy over closed bars, used for both history and live. Sandboxed under
+  `SubprocessExecutor`.
+- `param_problems()`: reports unknown keys, types and scopes in `__params__`.
+- `TransientSourceError`, for failures a plugin wants retried.
 - **`script_params()` / `resolve_params()`** in `tradingkit.core.script_ast`: one exec-free
   reader for `__params__`, with values cast to the declared type and checked against
   `options`, `min` and `max`. A host app can build a form from a script and keep the values

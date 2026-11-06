@@ -20,13 +20,14 @@ from datetime import datetime
 from typing import Any, Self
 
 from tradingkit.core.clickhouse import ClickHouseManager
-from tradingkit.core.timeframe import UNIT_SCALE
+from tradingkit.core.timeframe import UNIT_SCALE, seconds_to_tf_string
 from tradingkit.source import DataSource, ScriptSource
 
 logger = logging.getLogger(__name__)
 
 _CONCURRENCY      = 5
 _GAP_INTERVAL     = 60
+_BAR_CLOSE_DELAY  = 2.0
 _HEALTH_INTERVAL  = 30
 _RECONNECT_CD     = 120
 _INFLIGHT_TTL     = 180
@@ -83,6 +84,7 @@ class _ConnectionWorker:
         agg_script: Any = None,
         *,
         executor:           Any = None,
+        on_bar_closed:      Any = None,
         concurrency:        int = _CONCURRENCY,
         gap_interval:       int = _GAP_INTERVAL,
         health_interval:    int = _HEALTH_INTERVAL,
@@ -92,6 +94,7 @@ class _ConnectionWorker:
         stalled_threshold:  int = _STALLED_THRESHOLD,
     ) -> None:
         self._conn       = conn
+        self._on_bar_closed = on_bar_closed
         self._db         = db
         self._source     = source
         self._live_feed  = live_feed
@@ -102,28 +105,29 @@ class _ConnectionWorker:
             from tradingkit.executor.local import LocalExecutor
             executor = LocalExecutor()
         self._executor = executor
+        self._session: Any = None
+        self._gap_wake = asyncio.Event()
 
         self._exchange  = (conn.get("source") or "").replace(".py", "")
-        self._symbol    = conn["symbol"]
-
-        # Rows are always one-minute units, so that is their label whatever the connection
-        # asks for: storing them under conn["timeframe"] filed minute bars as "1h" candles,
-        # and higher timeframes come from aggregation anyway.
-        self._timeframe = "1m"
-        if conn.get("timeframe", "1m") != "1m":
-            logger.warning(
-                f"Connection {conn.get('name')!r}: timeframe {conn['timeframe']!r} ignored, "
-                "sources are collected as 1m units and aggregated upward"
-            )
-
-        # Source always writes one unit per interval; framework aggregates upward via MV.
-        # Expressed in the source's own timestamp unit (see DataSource.timestamp_unit),
-        # so a millisecond source gets 60_000 rather than 60.
-        self._unit_interval: int = 60 * UNIT_SCALE.get(source.timestamp_unit, 1)
+        self._symbol    = conn.get("symbol", "")
 
         hist_cfg = json.loads(conn.get("config", "{}")) if isinstance(conn.get("config"), str) \
                    else conn.get("config", {})
-        self._start_date    = conn.get("start_date", "2020-01-01T00:00:00Z")
+
+        # Rows carry the step their stream declares, whatever the connection asks for:
+        # higher timeframes come from aggregation. A stream that declares none is a
+        # one-minute one, in the source's own timestamp unit.
+        self._stream_name = source.resolve_stream(hist_cfg.get("stream"))
+        self._stream = source.stream_spec(self._stream_name)
+        scale = UNIT_SCALE.get(source.timestamp_unit, 1)
+        self._unit_interval: int = self._stream.step or 60 * scale
+        self._timeframe = seconds_to_tf_string(self._unit_interval // scale)
+        if conn.get("timeframe", self._timeframe) != self._timeframe:
+            logger.warning(
+                f"Connection {conn.get('name')!r}: timeframe {conn['timeframe']!r} ignored, "
+                f"stream {self._stream_name!r} is collected as {self._timeframe} rows"
+            )
+        self._start_date    = conn.get("start_date") or None
         self._batch_size    = int(hist_cfg.get("batch_size",    1440))
 
         # Per-connection timing overrides from config JSON. Rate limiting and gap
@@ -131,6 +135,7 @@ class _ConnectionWorker:
         # batch_gaps), which reads the same config dict, since both are properties of
         # the exchange rather than of this worker.
         self._concurrency        = int(hist_cfg.get("concurrency",          concurrency))
+        self._bar_close_delay    = float(hist_cfg.get("bar_close_delay_s",  _BAR_CLOSE_DELAY))
         self._gap_interval       = int(hist_cfg.get("gap_interval_s",       gap_interval))
         self._health_interval    = int(hist_cfg.get("health_interval_s",    health_interval))
         self._reconnect_cooldown = int(hist_cfg.get("reconnect_cooldown_s", reconnect_cooldown))
@@ -146,7 +151,7 @@ class _ConnectionWorker:
         self._tasks: list[asyncio.Task] = []
 
         # DataUnit table state (initialized on first insert)
-        self._table: str        = source.get_table_name() or f"unit_{self._exchange}"
+        self._table: str        = self._stream.table or f"unit_{self._exchange}"
         self._folds: list       = []
         self._tables_ready: bool = False
 
@@ -164,23 +169,38 @@ class _ConnectionWorker:
     # ------------------------------------------------------------------ #
 
     async def run(self) -> None:
-        if self._source.has_historical():
+        await self._open_session()
+        recovers_history = bool(
+            self._start_date and self._stream.history and self._source.has_history()
+        )
+        if recovers_history:
             try:
                 await self._backfill()
             except Exception as e:
                 self._log.error(f"Backfill failed: {e}")
                 self.progress["error"] = str(e)
 
-        if self._source.has_realtime():
+        if self._source.has_live():
             self._tasks.append(
                 asyncio.create_task(self._stream_realtime(), name=f"rt-{self._conn['name']}")
             )
 
-        self._tasks.append(
-            asyncio.create_task(self._gap_loop(), name=f"gap-{self._conn['name']}")
-        )
+        if self._stream.step and self._stream.history:
+            self._tasks.append(
+                asyncio.create_task(self._bar_close_loop(), name=f"close-{self._conn['name']}")
+            )
+
+        if recovers_history:
+            self._tasks.append(
+                asyncio.create_task(self._gap_loop(), name=f"gap-{self._conn['name']}")
+            )
 
         await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    async def _open_session(self) -> Any:
+        if self._session is None:
+            self._session = await self._executor.open_source(self._source)
+        return self._session
 
     async def stop(self) -> None:
         self.progress["status"] = "stopped"
@@ -190,6 +210,8 @@ class _ConnectionWorker:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        if self._session is not None:
+            await self._session.close()
 
     # ------------------------------------------------------------------ #
     # Table setup                                                          #
@@ -200,7 +222,7 @@ class _ConnectionWorker:
         if self._tables_ready:
             return
         schema = dict(zip(df.columns, df.dtypes))
-        await self._db.ensure_raw_table(self._table, schema)
+        await self._db.ensure_raw_table(self._table, schema, self._stream.updates)
         if self._agg_script is not None and self._agg_script.is_ch_mv():
             from tradingkit.schema import DataUnit
             unit = DataUnit(schema)
@@ -246,7 +268,7 @@ class _ConnectionWorker:
                     self.progress["total_stored"] += n
 
         await asyncio.gather(*[_run(*b) for b in batches])
-        self.progress["status"] = "streaming" if self._source.has_realtime() else "complete"
+        self.progress["status"] = "streaming" if self._source.has_live() else "complete"
         self._log.info(f"Backfill done: {self.progress['total_stored']} rows stored")
 
     # ------------------------------------------------------------------ #
@@ -258,10 +280,12 @@ class _ConnectionWorker:
         self.progress["status"] = "streaming"
         self._log.info(f"Starting realtime stream for {self._symbol}/{self._timeframe}")
         try:
-            # NOTE: unlike the historical path below, this does NOT go through the
-            # executor -- PluginExecutor has no streaming method, so user script code
-            # runs unsandboxed here. Tracked separately; see framework.todo.
-            async for row in self._source.stream(self._symbol, self._unit_interval):
+            session = await self._open_session()
+            stream = session.stream(
+                self._symbol, self._unit_interval,
+                on_event=self._on_stream_event, stream=self._stream_name,
+            )
+            async for row in stream:
                 self._last_row_ts = time.time()
                 df = pl.DataFrame([row])
                 await self._ensure_tables(df)
@@ -277,14 +301,74 @@ class _ConnectionWorker:
             self.progress["status"] = "error"
             self.progress["error"]  = str(e)
 
+    async def _bar_close_loop(self) -> None:
+        """Closes bars by the clock: replaces each finished bar with the exchange's own
+        record, then announces it. A stream can miss a bar's last update, and bars in
+        history are what a backtest sees, so this is what keeps the two equal."""
+        scale = self._scale()
+        step  = self._unit_interval / scale
+        while True:
+            try:
+                now = time.time()
+                bar_end = (now // step + 1) * step
+                await asyncio.sleep(bar_end + self._bar_close_delay - now)
+                bar_ts = int((bar_end - step) * scale)
+                official = await self._store_official_bar(bar_ts)
+                if self._on_bar_closed is not None:
+                    await self._on_bar_closed(
+                        self._exchange, self._symbol, self._timeframe, bar_ts, official,
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._log.error(f"Bar close error: {e}")
+
+    async def _store_official_bar(self, bar_ts: int) -> bool:
+        try:
+            session = await self._open_session()
+            df = await session.fetch(
+                self._symbol, self._unit_interval, bar_ts, bar_ts, stream=self._stream_name,
+            )
+            if df.is_empty():
+                return False
+            await self._ensure_tables(df)
+            await self._db.insert_unit_batch(
+                self._table, df, self._exchange, self._symbol, self._timeframe,
+            )
+            await self._db.flush()
+            return True
+        except Exception as e:
+            self._log.warning(f"Official bar {bar_ts} unavailable: {e}")
+            return False
+
+    def _on_stream_event(self, event: dict) -> None:
+        if event["event"] == "reconnecting":
+            self._log.warning(f"Stream lost: {event['error']}")
+            self.progress["status"] = "reconnecting"
+            self.progress["error"]  = event["error"]
+        elif event["event"] == "connected":
+            self._log.info("Stream reconnected")
+            self.progress["status"] = "streaming"
+            self.progress["error"]  = None
+            self._gap_wake.set()
+
     # ------------------------------------------------------------------ #
     # Gap recovery                                                         #
     # ------------------------------------------------------------------ #
 
+    async def _wait_for_gap_cycle(self) -> None:
+        """Next cycle comes after the interval, or at once when a stream reconnects, since
+        that is exactly when rows have just gone missing."""
+        try:
+            await asyncio.wait_for(self._gap_wake.wait(), self._current_gap_interval())
+        except asyncio.TimeoutError:
+            pass
+        self._gap_wake.clear()
+
     async def _gap_loop(self) -> None:
         while True:
             try:
-                await asyncio.sleep(self._current_gap_interval())
+                await self._wait_for_gap_cycle()
                 await self._gap_cycle()
             except asyncio.CancelledError:
                 break
@@ -328,10 +412,14 @@ class _ConnectionWorker:
         now = time.time()
         self._inflight = {k: v for k, v in self._inflight.items() if now - v < self._inflight_ttl}
 
+        batches: list[dict] = []
+
         async def _detect() -> list[dict]:
             gaps = await self._detect_gaps(start_ts, end_ts)
             if gaps:
                 self._log.info(f"Found {len(gaps)} gaps in {self._symbol}/{self._timeframe}")
+                session = await self._open_session()
+                batches.extend(await session.batch_gaps(gaps))
             return gaps
 
         async def _fetch_batch(bstart: int, bend: int) -> int | None:
@@ -346,7 +434,7 @@ class _ConnectionWorker:
         # detect comes from the worker (ClickHouse knows what's missing), batch from the
         # source (the exchange's own limits decide what fits in one request).
         results = await recover_gaps(
-            detect=_detect, batch=self._source.batch_gaps, fetch=_fetch_batch,
+            detect=_detect, batch=lambda _: batches, fetch=_fetch_batch,
         )
         if not results:
             return True
@@ -358,7 +446,7 @@ class _ConnectionWorker:
         gaps: list[dict] = []
         try:
             min_ts, max_ts = await self._db.get_unit_range(
-                self._table, self._exchange, self._symbol,
+                self._table, self._exchange, self._symbol, self._timeframe,
             )
             iv = self._unit_interval
             if min_ts is None:
@@ -376,7 +464,7 @@ class _ConnectionWorker:
                                  "missing_rows": missing})
 
             middle = await self._db.find_unit_gaps(
-                self._table, self._exchange, self._symbol,
+                self._table, self._exchange, self._symbol, self._timeframe,
                 start_ts, end_ts, unit_interval_s=iv,
             )
             gaps.extend(middle)
@@ -402,13 +490,9 @@ class _ConnectionWorker:
         if await self._batch_complete(start_ts, end_ts):
             return 0
         try:
-            # Through the executor rather than calling the script directly, so a
-            # SubprocessExecutor actually isolates user code here (LocalExecutor keeps
-            # the previous in-process behaviour). Throttling lives on the source now --
-            # rate limits belong to the exchange, not to this worker.
-            await self._source.rate_limit()
-            df = await self._executor.fetch_source_data(
-                self._source, self._symbol, self._unit_interval, start_ts, end_ts,
+            session = await self._open_session()
+            df = await session.fetch(
+                self._symbol, self._unit_interval, start_ts, end_ts, stream=self._stream_name,
             )
             if df is None or df.is_empty():
                 return 0
@@ -418,6 +502,8 @@ class _ConnectionWorker:
                 self._table, df, self._exchange, self._symbol, self._timeframe
             )
             await self._db.flush()
+            if self._table == "candles":
+                await self._db.invalidate_derived(self._exchange, self._symbol, start_ts)
             if total > 1:
                 self._log.debug(
                     f"Batch {batch_num}/{total}: {row_count} rows "
@@ -430,13 +516,10 @@ class _ConnectionWorker:
 
     async def _batch_complete(self, start_ts: int, end_ts: int) -> bool:
         try:
-            min_ts, max_ts = await self._db.get_unit_range(
-                self._table, self._exchange, self._symbol,
+            stored = await self._db.count_unit_rows(
+                self._table, self._exchange, self._symbol, self._timeframe, start_ts, end_ts,
             )
-            if min_ts is None:
-                return False
-            # Rough check: if range covers the window, assume complete
-            return min_ts <= start_ts and max_ts >= end_ts - self._unit_interval * 2
+            return stored >= (end_ts - start_ts) // self._unit_interval + 1
         except Exception:
             return False
 
@@ -494,6 +577,7 @@ class DataCollector:
         inflight_ttl:       int = _INFLIGHT_TTL,
         max_gap_interval:   int = _MAX_GAP_INTERVAL,
         stalled_threshold:  int = _STALLED_THRESHOLD,
+        on_bar_closed:      Any = None,
     ) -> None:
         self._db        = db
         self._live_feed = live_feed
@@ -502,6 +586,7 @@ class DataCollector:
         self._executor  = executor
         self._timing = {
             "executor": executor,
+            "on_bar_closed": on_bar_closed,
             "concurrency": concurrency,
             "gap_interval": gap_interval,
             "health_interval": health_interval,

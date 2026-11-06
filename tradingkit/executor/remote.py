@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 import polars as pl
 import pyarrow as pa
 
-from tradingkit.executor.base import PluginExecutor
+from tradingkit.executor.base import PluginExecutor, SourceSession
 
 if TYPE_CHECKING:
     from tradingkit.indicator import Indicator, IndicatorContext
@@ -46,6 +46,28 @@ def _arrow_bytes_to_df(data: bytes) -> pl.DataFrame:
     buf = pa.py_buffer(data)
     reader = pa.ipc.open_stream(buf)
     return pl.from_arrow(reader.read_all())
+
+
+class _RemoteSourceSession(SourceSession):
+    """Fetches run on the runner; streaming stays in-process, as the runner has no stream
+    endpoint."""
+
+    def __init__(self, source: DataSource, executor: RemoteExecutor) -> None:
+        super().__init__(source)
+        self._executor = executor
+
+    async def fetch(
+        self,
+        symbol: str,
+        timeframe: int,
+        start_ts: int,
+        end_ts: int,
+        limit: int = 5000,
+        stream: str | None = None,
+    ) -> pl.DataFrame:
+        return await self._executor.fetch_source_data(
+            self._source, symbol, timeframe, start_ts, end_ts, limit,
+        )
 
 
 class RemoteExecutor(PluginExecutor):
@@ -141,6 +163,9 @@ class RemoteExecutor(PluginExecutor):
             return None
         from tradingkit.strategy import Signal
         return Signal.from_dict(result["signal"])
+
+    async def open_source(self, source: DataSource) -> SourceSession:
+        return _RemoteSourceSession(source, self)
 
     async def fetch_source_data(
         self,

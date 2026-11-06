@@ -87,16 +87,20 @@ class _UnitTablesMixin:
     """Generic raw/aggregated DataUnit tables, backing AggregationContext.query()."""
 
     @_validates_identifiers("table_name")
-    async def ensure_raw_table(self, table_name: str, schema: dict) -> None:
-        """CREATE TABLE IF NOT EXISTS {table_name} (ReplacingMergeTree) from Polars schema."""
+    async def ensure_raw_table(
+        self, table_name: str, schema: dict, updates: str = "replace",
+    ) -> None:
+        """CREATE TABLE IF NOT EXISTS {table_name} from a Polars schema. "replace" keeps the
+        last row per timestamp, "append" keeps every row."""
         from tradingkit.schema import POLARS_TO_CH
         for col in schema:
             _validate_identifier(col, kind="column name")
+        engine = "ReplacingMergeTree" if updates == "replace" else "MergeTree"
         cols = ["exchange String", "symbol String", "timeframe String"]
         cols += [f"{col} {POLARS_TO_CH.get(dtype, 'String')}" for col, dtype in schema.items()]
         await self._execute(
             f"CREATE TABLE IF NOT EXISTS {table_name} ({', '.join(cols)})"
-            " ENGINE = ReplacingMergeTree ORDER BY (exchange, symbol, timestamp)"
+            f" ENGINE = {engine} ORDER BY (exchange, symbol, timestamp)"
         )
         # Tables created before `timeframe` existed here won't get it from CREATE ... IF NOT
         # EXISTS alone -- ADD COLUMN IF NOT EXISTS is the idempotent migration for those.
@@ -187,16 +191,36 @@ class _UnitTablesMixin:
         table_name: str,
         exchange: str,
         symbol: str,
+        timeframe: str,
     ) -> tuple[int | None, int | None]:
-        """min/max timestamp in a raw unit table."""
+        """min/max timestamp of one timeframe in a raw unit table."""
         rows = await self._execute(
-            f"SELECT min(timestamp), max(timestamp) FROM {table_name}"
-            " WHERE exchange = %(ex)s AND symbol = %(sym)s",
-            {"ex": exchange, "sym": symbol},
+            f"SELECT min(timestamp), max(timestamp), count() FROM {table_name}"
+            " WHERE exchange = %(ex)s AND symbol = %(sym)s AND timeframe = %(tf)s",
+            {"ex": exchange, "sym": symbol, "tf": timeframe},
         )
-        if rows and rows[0][0] is not None:
+        if rows and rows[0][2]:
             return int(rows[0][0]), int(rows[0][1])
         return None, None
+
+    @_validates_identifiers("table_name")
+    async def count_unit_rows(
+        self,
+        table_name: str,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> int:
+        """Distinct rows of one timeframe stored in a timestamp range."""
+        rows = await self._execute(
+            f"SELECT count() FROM {table_name} FINAL"
+            " WHERE exchange = %(ex)s AND symbol = %(sym)s AND timeframe = %(tf)s"
+            " AND timestamp BETWEEN %(st)s AND %(et)s",
+            {"ex": exchange, "sym": symbol, "tf": timeframe, "st": start_ts, "et": end_ts},
+        )
+        return int(rows[0][0]) if rows else 0
 
     @_validates_identifiers("table_name")
     async def find_unit_gaps(
@@ -204,6 +228,7 @@ class _UnitTablesMixin:
         table_name: str,
         exchange: str,
         symbol: str,
+        timeframe: str,
         start_ts: int,
         end_ts: int,
         unit_interval_s: int = 60,
@@ -220,13 +245,13 @@ class _UnitTablesMixin:
                     timestamp AS cur_ts,
                     lagInFrame(timestamp) OVER (ORDER BY timestamp) AS prev_ts
                 FROM {table_name} FINAL
-                WHERE exchange = %(ex)s AND symbol = %(sym)s
+                WHERE exchange = %(ex)s AND symbol = %(sym)s AND timeframe = %(tf)s
                   AND timestamp BETWEEN %(st)s AND %(et)s
             )
             WHERE prev_ts > 0 AND (cur_ts - prev_ts) > {unit_interval_s}
         """
         rows = await self._execute(sql, {
-            "ex": exchange, "sym": symbol, "st": start_ts, "et": end_ts,
+            "ex": exchange, "sym": symbol, "tf": timeframe, "st": start_ts, "et": end_ts,
         })
         return [
             {
