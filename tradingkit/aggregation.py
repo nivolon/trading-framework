@@ -567,8 +567,10 @@ class AggregationWorker:
 class AggregationScript:
     """
     Wrapper around a within-table bucket-aggregation script (`aggregation(unit) ->
-    AggSpec`, tradingkit/schema.py's Fold machinery) — consumed by DataCollector to
-    auto-create per-connection candles_60s/_3600s tables + Materialized Views.
+    AggSpec`, tradingkit/schema.py's Fold machinery). fold() builds bars of any timeframe
+    from the stored rows at query time. DataCollector can also materialize `buckets` into
+    per-bucket tables, but a Materialized View sees every insert: a bar re-inserted while
+    it forms is folded again, so sums over a "replace" stream come out inflated.
 
     NOT the cross-table mechanism — that's Aggregation/ScriptAggregation above. This class
     used to also wrap the cross-table aggregate(ctx, start_ts, end_ts) convention; that
@@ -591,15 +593,61 @@ class AggregationScript:
         return self._ast.get_literal("SOURCE_TABLE")
 
     def get_agg_spec_for_unit(self, unit: Any) -> Any | None:
+        try:
+            return self.spec_for_unit(unit)
+        except Exception:
+            return None
+
+    def spec_for_unit(self, unit: Any) -> Any:
+        """The AggSpec the script returns for `unit`; raises when the script is broken."""
+        from tradingkit.schema import AggSpec
         ns: dict = {}
         exec(compile(self._code, "<aggregation_script>", "exec"), ns)  # noqa: S102
         fn = ns.get("aggregation")
         if not callable(fn):
-            return None
-        try:
-            return fn(unit)
-        except Exception:
-            return None
+            raise ValueError("The script defines no aggregation(unit) function")
+        spec = fn(unit)
+        if not isinstance(spec, AggSpec):
+            raise TypeError(f"aggregation(unit) must return AggSpec, got {type(spec).__name__}")
+        return spec
+
+    async def spec_for_table(self, db: Any) -> tuple[str, Any]:
+        """The source table and the AggSpec built from that table's columns."""
+        from tradingkit.schema import DataUnit
+        table = self.get_source_table() or "candles"
+        schema = await db.get_table_schema(table)
+        if not schema:
+            raise ValueError(f"Source table {table!r} does not exist yet")
+        return table, self.spec_for_unit(DataUnit(schema))
+
+    async def fold(
+        self,
+        db: Any,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        *,
+        start_ts: int | None = None,
+        end_ts: int | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[dict]:
+        """Bars of any `timeframe`, folded at query time from the market's stored rows.
+
+        The timeframe must be a whole multiple of the finest stored timeframe.
+        """
+        from tradingkit.core.timeframe import parse_timeframe
+        table, spec = await self.spec_for_table(db)
+        base = await db.base_timeframe(table, exchange, symbol)
+        if base is None:
+            return []
+        bucket_s = parse_timeframe(timeframe)
+        if bucket_s % parse_timeframe(base):
+            raise ValueError(f"{timeframe} is not a whole multiple of the stored {base} rows")
+        return await db.fold_buckets(
+            table, spec.folds, bucket_s, exchange, symbol, base,
+            start_ts=start_ts, end_ts=end_ts, limit=limit, newest_first=newest_first,
+        )
 
 
 # Empty by default -- a host app can register its own via get_builtin_registry()

@@ -366,6 +366,67 @@ class _UnitTablesMixin:
         cols = ["bucket"] + aliases
         return [dict(zip(cols, r)) for r in rows]
 
+    @_validates_identifiers("table_name")
+    async def base_timeframe(self, table_name: str, exchange: str, symbol: str) -> str | None:
+        """The finest timeframe stored for a market: the rows every bucket folds from."""
+        from tradingkit.core.timeframe import parse_timeframe
+        rows = await self._execute(
+            f"SELECT DISTINCT timeframe FROM {table_name} WHERE exchange = %(ex)s AND symbol = %(sym)s",
+            {"ex": exchange, "sym": symbol},
+        )
+        labels = [r[0] for r in rows if r[0]]
+        return min(labels, key=parse_timeframe) if labels else None
+
+    @_validates_identifiers("table_name")
+    async def fold_buckets(
+        self,
+        table_name: str,
+        folds: list,
+        bucket_s: int,
+        exchange: str,
+        symbol: str,
+        base_timeframe: str,
+        start_ts: int | None = None,
+        end_ts: int | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[dict]:
+        """Fold stored rows into `bucket_s` buckets at query time, one dict per bucket.
+
+        Reads the deduplicated rows (FINAL) of one market at `base_timeframe`, so a bar
+        re-inserted while it formed counts once and stored higher timeframes are ignored.
+        `end_ts` is exclusive and refers to bucket starts.
+        """
+        from tradingkit.schema import Fold, PyFold
+        if any(isinstance(f, PyFold) for f in folds):
+            raise ValueError("Python folds (.compute()) cannot be folded in ClickHouse; use Fold methods")
+        bucket_s = int(bucket_s)
+        if bucket_s <= 0:
+            raise ValueError(f"Bucket must be positive, got {bucket_s}")
+        ch_folds = [f for f in folds if isinstance(f, Fold)]
+        aliases = [_validate_identifier(f._alias or f.field, kind="fold alias") for f in ch_folds]
+        if "timestamp" in aliases:
+            raise ValueError("A fold cannot be called 'timestamp': it names the bucket start")
+        selects = [f"intDiv(timestamp, {bucket_s}) * {bucket_s} AS bucket"]
+        selects += [f.ch_expr(a) for f, a in zip(ch_folds, aliases)]
+        where = "exchange = %(ex)s AND symbol = %(sym)s AND timeframe = %(tf)s"
+        params: dict[str, Any] = {"ex": exchange, "sym": symbol, "tf": base_timeframe}
+        if start_ts is not None:
+            where += " AND timestamp >= %(st)s"; params["st"] = int(start_ts) // bucket_s * bucket_s
+        if end_ts is not None:
+            where += " AND timestamp < %(et)s"; params["et"] = int(end_ts) // bucket_s * bucket_s
+        order = "DESC" if newest_first else "ASC"
+        lim = f" LIMIT {int(limit)}" if limit else ""
+        rows = await self._execute(
+            f"SELECT {', '.join(selects)} FROM {table_name} FINAL WHERE {where}"
+            f" GROUP BY bucket ORDER BY bucket {order}{lim}",
+            params,
+            settings={"prefer_column_name_to_alias": 1},
+            strict=True,
+        )
+        cols = ["timestamp"] + aliases
+        return [dict(zip(cols, r)) for r in rows]
+
     # ------------------------------------------------------------------ #
     # Cross-source alignment (TASK-005) — backs tradingkit.aggregation.Aggregation.        #
     # ------------------------------------------------------------------ #

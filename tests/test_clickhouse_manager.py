@@ -78,6 +78,11 @@ async def test_ensure_raw_table_engine_follows_the_update_mode(fake_ch_http):
     assert "ENGINE = MergeTree" in _sql(fake_ch_http, 2)
 
 
+def test_lists_become_escaped_sql_tuples():
+    sql = ClickHouseManager._interpolate("x IN %(ids)s", {"ids": ("a", "b'c", 1)})
+    assert sql == "x IN ('a', 'b\\'c', 1)"
+
+
 async def test_fetch_data_parses_rows_into_dicts(fake_ch_http):
     fake_ch_http._responses.append(FakeChResponse(json_data={
         "data": [[1000, 1.0, 2.0, 0.5, 1.5, 10.0]],
@@ -311,3 +316,67 @@ async def test_store_signal_still_accepts_the_old_keyword_form():
     _, _, _, _, _, signal_type, confidence, price, metadata = db._signal_buffer[0]
     assert (signal_type, confidence, price) == ("BUY", 0.8, 10.0)
     assert json.loads(metadata) == {"rsi": 20}
+
+
+async def test_fold_buckets_folds_deduplicated_base_rows_at_query_time(fake_ch_http):
+    from tradingkit.schema import DataUnit
+    fake_ch_http._responses.append(FakeChResponse(json_data={"data": [[600, 1.0, 7.0]]}))
+    db = ClickHouseManager()
+    db._conn = object()
+    unit = DataUnit({"open": pl.Float64, "volume": pl.Float64})
+
+    rows = await db.fold_buckets(
+        "candles", [unit.open.first().alias("open"), unit.volume.sum().alias("volume")],
+        420, "whitebit", "BTC_USDT", "1m", start_ts=700, end_ts=1300, limit=5, newest_first=True,
+    )
+    sql = _sql(fake_ch_http)
+    assert "FROM candles FINAL" in sql
+    assert "intDiv(timestamp, 420) * 420 AS bucket" in sql
+    assert "argMin(open, timestamp) AS open" in sql
+    assert "sum(volume) AS volume" in sql
+    assert "timeframe = '1m'" in sql
+    assert "timestamp >= 420" in sql
+    assert "timestamp < 1260" in sql
+    assert "ORDER BY bucket DESC LIMIT 5" in sql
+    assert rows == [{"timestamp": 600, "open": 1.0, "volume": 7.0}]
+
+
+async def test_fold_buckets_rejects_python_folds():
+    import pytest
+    from tradingkit.schema import DataUnit
+    unit = DataUnit({"close": pl.Float64})
+    with pytest.raises(ValueError, match="Python folds"):
+        await ClickHouseManager().fold_buckets(
+            "candles", [unit.close.compute(pl.col("close")).alias("c")], 60, "x", "Y", "1m",
+        )
+
+
+async def test_base_timeframe_is_the_finest_stored_label(fake_ch_http):
+    fake_ch_http._responses.append(FakeChResponse(json_data={"data": [["15m"], ["1m"], ["7m"]]}))
+    db = ClickHouseManager()
+    db._conn = object()
+    assert await db.base_timeframe("candles", "whitebit", "BTC_USDT") == "1m"
+
+
+async def test_fold_buckets_prefers_columns_over_fold_aliases(fake_ch_http):
+    from tradingkit.schema import DataUnit
+    fake_ch_http._responses.append(FakeChResponse(json_data={"data": []}))
+    db = ClickHouseManager()
+    db._conn = object()
+    unit = DataUnit({"close": pl.Float64})
+    await db.fold_buckets(
+        "candles", [unit.close.last().alias("close"), unit.close.avg().alias("avg_close")],
+        60, "whitebit", "BTC_USDT", "1m",
+    )
+    assert "prefer_column_name_to_alias=1" in fake_ch_http.calls[-1]["url"]
+
+
+async def test_strict_execute_raises_the_server_message(fake_ch_http):
+    import pytest
+    from tradingkit.core.clickhouse import ClickHouseQueryError
+    fake_ch_http._responses.append(FakeChResponse(status=400, text_data="Code: 184. ILLEGAL_AGGREGATION"))
+    db = ClickHouseManager()
+    with pytest.raises(ClickHouseQueryError, match="ILLEGAL_AGGREGATION"):
+        await db._execute("SELECT 1", strict=True)
+    fake_ch_http._responses.append(FakeChResponse(status=400, text_data="boom"))
+    assert await db._execute("SELECT 1") == []

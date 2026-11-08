@@ -156,3 +156,11 @@ def test_numeric_args_always_pass():
 def test_legit_sumif_condition_passes():
     f = Fold("sumIf", "qty", "Float64", args=["side = 1"])
     assert f.args == ["side = 1"]
+
+def test_ch_expr_is_the_plain_aggregate_of_the_state_expression():
+    import polars as pl
+    from tradingkit.schema import DataUnit
+    unit = DataUnit({"close": pl.Float64, "volume": pl.Float64})
+    assert unit.close.last().alias("close").ch_expr("close") == "argMax(close, timestamp) AS close"
+    assert unit.close.quantile(0.9).ch_expr("q") == "quantile(0.9)(close) AS q"
+    assert unit.volume.sumIf("close > 0").ch_expr("up") == "sumIf(volume, close > 0) AS up"

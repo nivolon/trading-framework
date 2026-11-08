@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **`AggregationScript.fold()` builds bars of any timeframe at query time.** It reads the
+  script's `aggregation(unit)` folds against its `SOURCE_TABLE` and folds the market's
+  deduplicated base rows in ClickHouse (`fold_buckets()`, `Fold.ch_expr()`), so a custom
+  aggregation works for custom timeframes without per-bucket tables. `base_timeframe()`
+  finds the finest stored timeframe to fold from.
+- **`_execute(strict=True)` raises `ClickHouseQueryError`** with the server's message
+  instead of logging it and returning `[]`.
+
+### Fixed
+- **Query parameters accept lists and tuples**, rendered as escaped SQL tuples for `IN`.
+
 ### Fixed
 - **Minute bars were stored under the connection's timeframe.** A source always writes
   one-minute units, but `_ConnectionWorker` labelled them with `conn["timeframe"]`, so a

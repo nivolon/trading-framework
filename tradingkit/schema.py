@@ -194,6 +194,11 @@ class Fold:
         all_args = col_args if not self.args else f"{col_args}, {self._args_sql()}"
         return f"{self.fn}State({all_args}) AS {alias}"
 
+    def ch_expr(self, alias: str) -> str:
+        """Plain aggregate over raw rows, for folding at query time: argMin(open, timestamp) AS open."""
+        state = self.ch_state_expr(alias)
+        return state.replace(f"{self.fn}State", self.fn, 1)
+
     def ch_merge_expr(self, col: str) -> str:
         """
         Query SELECT fragment.

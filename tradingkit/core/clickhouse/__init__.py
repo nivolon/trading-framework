@@ -19,6 +19,7 @@ from tradingkit.core.clickhouse._connections import _ConnectionsMixin
 from tradingkit.core.clickhouse._indicators_signals import _IndicatorsSignalsMixin
 from tradingkit.core.clickhouse._plugin_library import _PluginLibraryMixin
 from tradingkit.core.clickhouse._sql import (
+    ClickHouseQueryError,
     _basic_auth_header,
     _SqlMixin,
     _validate_identifier,
@@ -127,6 +128,7 @@ def create_clickhouse_manager(config: dict | None = None) -> ClickHouseManager:
 
 __all__ = [
     "TIMEFRAME_SECONDS",
+    "ClickHouseQueryError",
     "ClickHouseManager",
     "_basic_auth_header",
     "_to_ch_interval",

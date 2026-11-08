@@ -380,3 +380,53 @@ async def test_missing_table_is_not_treated_as_ambiguous():
             raise RuntimeError("table does not exist")
 
     await Exploding().assert_source_unambiguous("not_created_yet")
+
+
+class _FoldDb:
+    def __init__(self, base="1m"):
+        self.base = base
+        self.calls: list[dict] = []
+
+    async def get_table_schema(self, table_name):
+        import polars as pl
+        return {"timestamp": pl.UInt64, "open": pl.Float64, "close": pl.Float64}
+
+    async def base_timeframe(self, table_name, exchange, symbol):
+        return self.base
+
+    async def fold_buckets(self, table_name, folds, bucket_s, exchange, symbol, base, **kw):
+        self.calls.append({"table": table_name, "aliases": [f._alias for f in folds],
+                           "bucket_s": bucket_s, "base": base, **kw})
+        return []
+
+
+_FOLD_SCRIPT = '''
+SOURCE_TABLE = "candles"
+
+def aggregation(unit):
+    from tradingkit.schema import AggSpec
+    return AggSpec(buckets=[300], folds=[unit.open.first().alias("open"), unit.close.last().alias("close")])
+'''
+
+
+async def test_fold_builds_any_timeframe_from_the_script_folds():
+    from tradingkit.aggregation import AggregationScript
+    db = _FoldDb()
+    await AggregationScript(_FOLD_SCRIPT).fold(db, "whitebit", "BTC_USDT", "7m", limit=10)
+    assert db.calls == [{"table": "candles", "aliases": ["open", "close"], "bucket_s": 420,
+                         "base": "1m", "start_ts": None, "end_ts": None, "limit": 10,
+                         "newest_first": False}]
+
+
+async def test_fold_rejects_a_timeframe_finer_than_the_stored_rows():
+    import pytest
+    from tradingkit.aggregation import AggregationScript
+    with pytest.raises(ValueError, match="multiple"):
+        await AggregationScript(_FOLD_SCRIPT).fold(_FoldDb(base="5m"), "whitebit", "BTC_USDT", "7m")
+
+
+async def test_fold_reports_a_script_without_aggregation():
+    import pytest
+    from tradingkit.aggregation import AggregationScript
+    with pytest.raises(ValueError, match="aggregation"):
+        await AggregationScript("X = 1").fold(_FoldDb(), "whitebit", "BTC_USDT", "5m")
