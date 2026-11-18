@@ -32,6 +32,7 @@ def run_strategy_script(
     import numpy as np
 
     from tradingkit.core.script_ast import resolve_params
+    from tradingkit.core.script_errors import run_script
     from tradingkit.indicator import _ta_ns
 
     column = lambda key: np.array([float(c[key]) for c in candles], dtype=np.float64)
@@ -44,7 +45,7 @@ def run_strategy_script(
         "ta": _ta_ns, "np": np, "Signal": Signal, "signals": signals, "result": None,
         **resolve_params(code, params),
     }
-    exec(compile(code, "<strategy_script>", "exec"), namespace)  # noqa: S102
+    run_script(code, "<strategy_script>", namespace)
 
     def record(timestamp: int, signal_type: Any, confidence: float, price: float, meta: dict) -> dict:
         return {

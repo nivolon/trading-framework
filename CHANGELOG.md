@@ -47,6 +47,8 @@ output plugin, `Sink`, delivers results.
   requires; the old table form stops building in 2027.
 
 ### Added
+- **Script errors name their line.** Strategy and indicator scripts raise `ScriptError`
+  with the line that failed, for example `Line 2: NameError: ...`, and its `line`.
 - **`SandboxExecutor` and the sandbox spawner (`python -m tradingkit.executor._spawner`).**
   Every plugin runs in a worker started inside another container, each worker as its
   own Unix user with memory, CPU-time, process and file-size limits, and every process

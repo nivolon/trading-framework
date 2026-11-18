@@ -13,6 +13,7 @@ import numpy as np
 import polars as pl
 
 from tradingkit.core.script_ast import resolve_params
+from tradingkit.core.script_errors import run_script
 
 # ------------------------------------------------------------------ #
 # TA namespace                                                          #
@@ -244,7 +245,7 @@ class ScriptIndicator(Indicator):
             "np":  np,
             **self.params,
         }
-        exec(compile(self._code, "<ui_indicator>", "exec"), namespace)  # noqa: S102
+        run_script(self._code, "<ui_indicator>", namespace)
         if "result" not in namespace:
             raise ValueError("Indicator code must assign to 'result'")
         return np.asarray(namespace["result"], dtype=np.float64)
@@ -564,7 +565,7 @@ def preview_indicator_script(
         "result": None,
         **params,
     }
-    exec(compile(code, "<indicator>", "exec"), namespace)  # noqa: S102
+    run_script(code, "<indicator>", namespace)
     return _preview_result(namespace.get("result"), namespace["ts"])
 
 

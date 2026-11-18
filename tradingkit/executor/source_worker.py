@@ -29,8 +29,8 @@ _STOP_TIMEOUT_S = 5.0
 
 
 def worker_env() -> dict[str, str]:
-    """Plugins do I/O, not number crunching, and every library sizing its thread pool to
-    the machine exhausts the worker's address-space limit."""
+    """Every library sizing its thread pool to the machine exhausts a worker's
+    address-space limit on a many-core host, so pools stay small."""
     threads = os.getenv("TRADINGKIT_SOURCE_WORKER_THREADS", "1")
     return {
         **os.environ,

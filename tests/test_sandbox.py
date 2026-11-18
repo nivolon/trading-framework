@@ -191,3 +191,13 @@ async def test_indicator_preview_runs_in_a_worker_and_queries_through_the_host()
         )
         assert result == {"type": "line", "data": [[60, 21.0], [120, 42.0]]}
     assert asked[0] == {"kind": "candles", "exchange": "whitebit", "symbol": "ETH_USDT", "timeframe": "1m"}
+
+
+def test_script_errors_name_the_line():
+    from tradingkit.core.script_errors import ScriptError
+    from tradingkit.strategy import run_strategy_script
+    candles = [{"timestamp": 60 * i, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0} for i in range(3)]
+    with pytest.raises(ScriptError, match="Line 2: NameError"):
+        run_strategy_script("x = 1\ny = missing + 1\n", candles)
+    with pytest.raises(ScriptError, match="Line 1"):
+        run_strategy_script("def broken(:\n", candles)

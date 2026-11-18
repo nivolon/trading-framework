@@ -204,7 +204,7 @@ class SubprocessExecutor(PluginExecutor):
         from tradingkit.executor.source_worker import worker_env
         if worker == "task":
             args = [f"--memory-mb={self._max_memory_mb}", f"--cpu-s={self._timeout_s}"]
-            return await spawn_local(_WORKER_SCRIPT, args)
+            return await spawn_local(_WORKER_SCRIPT, args, worker_env())
         return await spawn_local(_SESSION_SCRIPT, [f"--memory-mb={self._max_memory_mb}"], worker_env())
 
     async def _run_in_subprocess(
