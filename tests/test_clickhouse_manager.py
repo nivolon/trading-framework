@@ -41,27 +41,48 @@ async def test_fetch_data_reads_final_so_a_forming_bar_is_not_returned_twice(fak
     assert "FROM candles FINAL" in _sql(fake_ch_http)
 
 
-async def test_fetch_data_df_aggregates_from_stored_1m_labels(fake_ch_http):
+async def test_fetch_data_df_aggregates_from_the_market_base_timeframe(fake_ch_http):
+    fake_ch_http._responses.append(FakeChResponse(json_data={"data": [["15m"], ["5m"]]}))
     fake_ch_http._responses.append(FakeChResponse(json_data={"data": []}))
     db = ClickHouseManager()
     db._conn = object()
 
-    await db.fetch_data_df("whitebit", "BTC_USDT", 420, 0, 100)
+    await db.fetch_data_df("whitebit", "BTC_USDT", 1800, 0, 100)
     sql = _sql(fake_ch_http)
-    assert "timeframe = '1m'" in sql
-    assert "INTERVAL 7 MINUTE" in sql
+    assert "timeframe = '5m'" in sql
+    assert "intDiv(timestamp, 1800) * 1800 AS bucket" in sql
+    assert "GROUP BY bucket" in sql
 
 
-async def test_invalidate_derived_keeps_stored_minute_units(fake_ch_http):
+async def test_fetch_data_df_of_an_uncollected_market_is_empty(fake_ch_http):
+    fake_ch_http._responses.append(FakeChResponse(json_data={"data": []}))
+    db = ClickHouseManager()
+    db._conn = object()
+
+    df = await db.fetch_data_df("whitebit", "BTC_USDT", 1800, 0, 100)
+    assert df.height == 0 and len(fake_ch_http.calls) == 1
+
+
+async def test_weekly_bars_start_on_monday(fake_ch_http):
+    fake_ch_http._responses.append(FakeChResponse(json_data={"data": [["1m"]]}))
+    fake_ch_http._responses.append(FakeChResponse(json_data={"data": []}))
+    db = ClickHouseManager()
+    db._conn = object()
+
+    await db.fetch_data_df("whitebit", "BTC_USDT", 604800, 0, 100)
+    assert "(intDiv(timestamp - 345600, 604800) * 604800 + 345600) AS bucket" in _sql(fake_ch_http)
+
+
+async def test_invalidate_derived_keeps_the_rows_the_collector_writes(fake_ch_http):
     fake_ch_http._responses.append(FakeChResponse(json_data={"data": [["15m"]]}))
     fake_ch_http._responses.append(FakeChResponse(json_data={"data": []}))
     fake_ch_http._responses.append(FakeChResponse(json_data={"data": []}))
     db = ClickHouseManager()
     db._conn = object()
 
-    await db.invalidate_derived("whitebit", "BTC_USDT", 1000)
+    await db.invalidate_derived("whitebit", "BTC_USDT", 1000, "5m")
     statements = [call["body"] for call in fake_ch_http.calls]
-    assert "timeframe != '1m'" in statements[0]
+    assert "timeframe != '5m'" in statements[0]
     assert "timeframe = '15m'" in statements[1] and "timestamp >= 900" in statements[1]
     assert "ALTER TABLE indicators DELETE" in statements[2]
 

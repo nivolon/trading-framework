@@ -197,7 +197,7 @@ async def test_worker_does_not_run_builtins_nobody_added(monkeypatch):
         async def _execute(self, sql, params=None):
             return []
 
-    assert await AggregationWorker(_EmptyLibrary())._load_python_scripts() == []
+    assert await AggregationWorker(_EmptyLibrary())._load_scripts() == []
 
 
 # ---------------------------------------------------------------------------

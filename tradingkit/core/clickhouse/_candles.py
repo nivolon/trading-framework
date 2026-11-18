@@ -6,7 +6,12 @@ from typing import Any
 import polars as pl
 
 from tradingkit.core.clickhouse._sql import _validates_identifiers
-from tradingkit.core.timeframe import parse_timeframe, seconds_to_tf_string
+from tradingkit.core.timeframe import (
+    bucket_sql,
+    get_period_start,
+    parse_timeframe,
+    seconds_to_tf_string,
+)
 
 _OHLCV_SCHEMA = {
     "timestamp": pl.Int64,
@@ -90,14 +95,11 @@ class _CandlesMixin:
         if not self._conn:
             return pl.DataFrame(schema=_OHLCV_SCHEMA)
 
-        interval = _to_ch_interval(target_seconds)
         source_tf_str = seconds_to_tf_string(source_seconds)
 
         sql = f"""
             SELECT
-                toUnixTimestamp(
-                    toStartOfInterval(toDateTime(timestamp), INTERVAL {interval})
-                ) AS timestamp,
+                {bucket_sql("timestamp", target_seconds)} AS bucket,
                 argMin(open,  timestamp) AS open,
                 max(high)                AS high,
                 min(low)                 AS low,
@@ -109,8 +111,8 @@ class _CandlesMixin:
               AND timeframe = %(tf)s
               AND timestamp >= %(st)s
               AND timestamp <  %(et)s
-            GROUP BY timestamp
-            ORDER BY timestamp ASC
+            GROUP BY bucket
+            ORDER BY bucket ASC
             LIMIT %(lim)s
         """
         rows = await self._execute(sql, {
@@ -143,10 +145,13 @@ class _CandlesMixin:
         limit: int = 10000,
         table_name: str = "candles",
     ) -> pl.DataFrame:
-        """Bars of `timeframe_seconds` as a Polars DataFrame, built from stored 1m units."""
+        """Bars of `timeframe_seconds` as a Polars DataFrame, built from the market's base rows."""
+        base = await self.base_timeframe(table_name, exchange, symbol)
+        if base is None:
+            return pl.DataFrame(schema=_OHLCV_SCHEMA)
         return await self.fetch_ohlcv_aggregated(
             exchange, symbol,
-            source_seconds=60,
+            source_seconds=parse_timeframe(base),
             target_seconds=timeframe_seconds,
             start_ts=start_ts,
             end_ts=end_ts,
@@ -156,26 +161,31 @@ class _CandlesMixin:
 
     async def count_closed_bars(
         self, exchange: str, symbol: str, timeframe_seconds: int, before_ts: int,
+        base_timeframe: str,
     ) -> int:
-        """Bars of a timeframe that stored 1m units can fill, up to the forming bar."""
-        seconds = int(timeframe_seconds)
+        """Bars of a timeframe that the stored base rows can fill, up to the forming bar."""
         rows = await self._execute(
-            f"SELECT uniqExact(intDiv(timestamp, {seconds})) FROM candles FINAL"
-            " WHERE exchange = %(ex)s AND symbol = %(sym)s AND timeframe = '1m'"
+            f"SELECT uniqExact({bucket_sql('timestamp', timeframe_seconds)}) FROM candles FINAL"
+            " WHERE exchange = %(ex)s AND symbol = %(sym)s AND timeframe = %(tf)s"
             " AND timestamp < %(before)s",
-            {"ex": exchange, "sym": symbol, "before": before_ts},
+            {"ex": exchange, "sym": symbol, "tf": base_timeframe, "before": before_ts},
         )
         return int(rows[0][0]) if rows else 0
 
-    async def invalidate_derived(self, exchange: str, symbol: str, start_ts: int) -> None:
-        """Drop aggregated bars and indicator values built before `start_ts` was filled."""
+    async def invalidate_derived(
+        self, exchange: str, symbol: str, start_ts: int, base_timeframe: str,
+    ) -> None:
+        """Drop aggregated bars and indicator values built before `start_ts` was filled.
+
+        Every timeframe but `base_timeframe`, the one the collector writes, is derived.
+        """
         where = "exchange = %(ex)s AND symbol = %(sym)s"
-        params = {"ex": exchange, "sym": symbol, "st": start_ts}
+        params = {"ex": exchange, "sym": symbol, "st": start_ts, "base": base_timeframe}
         rows = await self._execute(
-            f"SELECT DISTINCT timeframe FROM candles WHERE {where} AND timeframe != '1m'", params,
+            f"SELECT DISTINCT timeframe FROM candles WHERE {where} AND timeframe != %(base)s", params,
         )
         for (timeframe,) in rows:
-            bar_start = start_ts - start_ts % parse_timeframe(timeframe)
+            bar_start = get_period_start(start_ts, parse_timeframe(timeframe))
             await self._execute(
                 f"ALTER TABLE candles DELETE WHERE {where} AND timeframe = %(tf)s"
                 " AND timestamp >= %(bar)s SETTINGS mutations_sync = 1",

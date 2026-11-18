@@ -13,6 +13,7 @@ from typing import Any
 import polars as pl
 
 from tradingkit.core.clickhouse._sql import _validate_identifier, _validates_identifiers
+from tradingkit.core.timeframe import bucket_sql, get_period_start
 
 # Tokenizer for cross-source combine_sql() expressions (e.g. "btc - eth", "(btc - eth) / eth").
 # Unlike table/column identifiers (_validate_identifier, a closed grammar), this needs to
@@ -134,7 +135,7 @@ class _UnitTablesMixin:
         selects   = [
             "exchange",
             "symbol",
-            f"intDiv(timestamp, {bucket_s}) * {bucket_s} AS bucket",
+            f"{bucket_sql('timestamp', bucket_s)} AS bucket",
         ]
         for f in folds:
             if isinstance(f, Fold):
@@ -155,7 +156,7 @@ class _UnitTablesMixin:
         selects   = [
             "exchange",
             "symbol",
-            f"intDiv(timestamp, {bucket_s}) * {bucket_s} AS bucket",
+            f"{bucket_sql('timestamp', bucket_s)} AS bucket",
         ]
         for f in folds:
             if isinstance(f, Fold):
@@ -407,14 +408,14 @@ class _UnitTablesMixin:
         aliases = [_validate_identifier(f._alias or f.field, kind="fold alias") for f in ch_folds]
         if "timestamp" in aliases:
             raise ValueError("A fold cannot be called 'timestamp': it names the bucket start")
-        selects = [f"intDiv(timestamp, {bucket_s}) * {bucket_s} AS bucket"]
+        selects = [f"{bucket_sql('timestamp', bucket_s)} AS bucket"]
         selects += [f.ch_expr(a) for f, a in zip(ch_folds, aliases)]
         where = "exchange = %(ex)s AND symbol = %(sym)s AND timeframe = %(tf)s"
         params: dict[str, Any] = {"ex": exchange, "sym": symbol, "tf": base_timeframe}
         if start_ts is not None:
-            where += " AND timestamp >= %(st)s"; params["st"] = int(start_ts) // bucket_s * bucket_s
+            where += " AND timestamp >= %(st)s"; params["st"] = get_period_start(int(start_ts), bucket_s)
         if end_ts is not None:
-            where += " AND timestamp < %(et)s"; params["et"] = int(end_ts) // bucket_s * bucket_s
+            where += " AND timestamp < %(et)s"; params["et"] = get_period_start(int(end_ts), bucket_s)
         order = "DESC" if newest_first else "ASC"
         lim = f" LIMIT {int(limit)}" if limit else ""
         rows = await self._execute(

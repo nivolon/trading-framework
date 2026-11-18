@@ -51,9 +51,35 @@ def seconds_to_tf_string(seconds: int) -> str:
     return f"{seconds}s"
 
 
+WEEK_SECONDS = 604800
+#: 1970-01-05 00:00 UTC, a Monday. Bars of whole weeks start on Mondays, as on exchanges;
+#: counted from the epoch itself they would start on Thursdays.
+WEEK_ORIGIN = 345600
+
+
+def bucket_origin(seconds: int) -> int:
+    """Offset from the epoch that bars of `seconds` are counted from."""
+    return WEEK_ORIGIN if seconds % WEEK_SECONDS == 0 else 0
+
+
 def get_period_start(timestamp: int, seconds: int) -> int:
-    """Return the start of the period containing timestamp, aligned to seconds boundaries."""
-    return (timestamp // seconds) * seconds
+    """Start of the bar of `seconds` that holds `timestamp`, in epoch seconds."""
+    origin = bucket_origin(seconds)
+    return (timestamp - origin) // seconds * seconds + origin
+
+
+def bucket_sql(column: str, seconds: int) -> str:
+    """ClickHouse expression for get_period_start() over a column of epoch seconds.
+
+    `column` is put into the SQL as is: pass a column name, never user input.
+    """
+    seconds = int(seconds)
+    if seconds <= 0:
+        raise ValueError(f"Bar length must be positive, got {seconds}")
+    origin = bucket_origin(seconds)
+    if not origin:
+        return f"intDiv({column}, {seconds}) * {seconds}"
+    return f"(intDiv({column} - {origin}, {seconds}) * {seconds} + {origin})"
 
 
 def get_period_end(timestamp: int, seconds: int) -> int:

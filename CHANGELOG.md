@@ -24,6 +24,26 @@ output plugin, `Sink`, delivers results.
 - **`AggregationWorker` runs only what is in `plugin_library`.** It used to fall back to
   the host app's `BUILTIN_AGGREGATIONS`, so a fresh install ran templates nobody had added
   and polled tables that did not exist. Builtins remain available as templates.
+- **Breaking: `AggregationWorker(db, executor=None, table_allowed=None, poll_interval=60)`
+  runs cross-source scripts in the executor's workers.** The host no longer executes them:
+  it reads their declarations (`describe_cross_source()`) and rows
+  (`run_cross_source_combine()`) as plain data and answers `ctx.query()` itself, only for
+  tables `table_allowed` accepts. Each project writes to its own table,
+  `output_table_name(namespace, OUTPUT_TABLE)`, which always starts with `agg_`.
+  `COMBINE_SQL` scripts now get their Materialized Views installed (nothing did before),
+  once per version of the code, and MVs whose script is gone or changed are dropped.
+  `run_once()` does one pass; `status` holds each script's last error. `_run_one()` and
+  `_load_python_scripts()` are gone.
+- **Built-in OHLCV bars fold from the market's base timeframe**, the finest one stored,
+  instead of assuming `1m`: a source with a `5m` or `1s` stream gets every multiple of it.
+  `_ensure_ohlcv_agg()` raises `ValueError` for a timeframe the base cannot build, and
+  `fetch_data_df()` reads the base. **Breaking:** `count_closed_bars()` and
+  `invalidate_derived()` take the base timeframe; `invalidate_derived()` used to treat
+  every timeframe but `1m` as derived, and would have deleted a `5m` source's own rows.
+- **Weekly bars start on Mondays everywhere.** Built-in bars started on Mondays while
+  aggregation folds, Materialized Views and closed-bar counts started on Thursdays (the
+  epoch's weekday), so the same week differed between them. `get_period_start()` follows
+  the same rule.
 - **`PluginExecutor.open_source()`** returns a `SourceSession`. Under `SubprocessExecutor`
   it is a long-lived worker process per connection: the plugin is set up once, streaming
   is isolated for the first time, and a dead worker is restarted.
@@ -47,6 +67,14 @@ output plugin, `Sink`, delivers results.
   requires; the old table form stops building in 2027.
 
 ### Added
+- **`bucket_sql(column, seconds)`** is `get_period_start()` as a ClickHouse expression, so
+  SQL and Python agree on where a bar starts.
+- **C++ indicators run in a worker (`tradingkit.cpp`).** `preview_cpp_indicator()`
+  compiles a file exporting `extern "C" void indicator_compute(...)` with the system g++
+  and loads it from memory, so worker temp directories can stay `noexec`. Includes are
+  limited to `ALLOWED_INCLUDES`, compile errors raise `ScriptError` with the line, and
+  `cpp_params()` reads parameter defaults from calls like
+  `read_int(params_json, "period", 20)`.
 - **Script errors name their line.** Strategy and indicator scripts raise `ScriptError`
   with the line that failed, for example `Line 2: NameError: ...`, and its `line`.
 - **`SandboxExecutor` and the sandbox spawner (`python -m tradingkit.executor._spawner`).**

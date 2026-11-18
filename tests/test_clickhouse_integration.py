@@ -53,9 +53,29 @@ async def db():
 
 
 @pytest.fixture
-def table_name() -> str:
+async def created_tables(db):
+    """Names of the tables a test creates. Afterwards those tables are dropped, with the
+    Materialized Views that read them, and nothing else."""
+    tables: list[str] = []
+    yield tables
+    for table in tables:
+        views = await db._execute(
+            "SELECT name FROM system.tables WHERE database = currentDatabase()"
+            " AND engine = 'MaterializedView' AND startsWith(name, %(prefix)s)",
+            {"prefix": f"mv_{table}_to_"},
+        )
+        for (view,) in views:
+            await db._execute(f"DROP VIEW IF EXISTS {view}")
+    for table in tables:
+        await db._execute(f"DROP TABLE IF EXISTS {table}")
+
+
+@pytest.fixture
+def table_name(created_tables) -> str:
     # unique per test run so parallel/repeat runs don't collide on leftover tables
-    return f"test_unit_{uuid.uuid4().hex[:12]}"
+    name = f"test_unit_{uuid.uuid4().hex[:12]}"
+    created_tables += [name, f"{name}_60s"]
+    return name
 
 
 async def test_native_protocol_connects(db):
@@ -193,7 +213,7 @@ async def test_agg_table_with_combinator_function(db, table_name):
     assert by_bucket.get(0) == pytest.approx(30.0)  # rows where side=1: 10 + 20
 
 
-async def test_cross_source_aggregation_out_of_order_arrival(db):
+async def test_cross_source_aggregation_out_of_order_arrival(db, created_tables):
     """The core TASK-005 mechanism: two sources arriving in different order still produce
     a correct combined value once both are present, and never a misleading partial result
     before that -- this is the exact scenario verified by hand while designing the gap-
@@ -206,6 +226,7 @@ async def test_cross_source_aggregation_out_of_order_arrival(db):
     btc_table = f"test_btc_{suffix}"
     eth_table = f"test_eth_{suffix}"
     output_table = f"test_spread_{suffix}"
+    created_tables += [btc_table, eth_table, output_table]
 
     await db._execute(f"CREATE TABLE {btc_table} (timestamp UInt64, close Float64) ENGINE=MergeTree ORDER BY timestamp")
     await db._execute(f"CREATE TABLE {eth_table} (timestamp UInt64, close Float64) ENGINE=MergeTree ORDER BY timestamp")
@@ -232,7 +253,7 @@ async def test_cross_source_aggregation_out_of_order_arrival(db):
     assert rows == [{"timestamp": 1000, "value": 47000.0}]
 
 
-async def test_cross_source_aggregation_with_int64_timestamp_source(db):
+async def test_cross_source_aggregation_with_int64_timestamp_source(db, created_tables):
     """Regression: ensure_cross_source_mv/backfill_cross_source hardcoded UInt64 for the
     timestamp baked into the AggregateFunction(argMax, ..., UInt64) state, but a real
     DataSource's schema (e.g. WhiteBitDataSource, and ensure_raw_table's own POLARS_TO_CH
@@ -250,6 +271,7 @@ async def test_cross_source_aggregation_with_int64_timestamp_source(db):
     btc_table = f"test_btc_i64_{suffix}"
     eth_table = f"test_eth_i64_{suffix}"
     output_table = f"test_spread_i64_{suffix}"
+    created_tables += [btc_table, eth_table, output_table]
 
     await db._execute(f"CREATE TABLE {btc_table} (timestamp Int64, close Float64) ENGINE=MergeTree ORDER BY timestamp")
     await db._execute(f"CREATE TABLE {eth_table} (timestamp Int64, close Float64) ENGINE=MergeTree ORDER BY timestamp")
@@ -271,31 +293,37 @@ async def test_cross_source_aggregation_with_int64_timestamp_source(db):
     assert rows == [{"timestamp": 1000, "value": 47000.0}]
 
 
-async def test_cross_source_aggregation_combine_python_fallback(db):
-    """combine() (Python fallback) driven end-to-end through AggregationWorker._run_one(),
+async def test_cross_source_aggregation_combine_python_fallback(db, monkeypatch):
+    """combine() (Python fallback) driven end-to-end through AggregationWorker.run_once(),
     the same code path a real background worker uses -- not just calling combine() directly."""
     import uuid
 
-    from tradingkit.aggregation import Aggregation, AggregationWorker
+    from tradingkit.aggregation import AggregationWorker, output_table_name
 
-    suffix = uuid.uuid4().hex[:8]
-    output_table = f"test_py_agg_{suffix}"
+    namespace = f"test_ns_{uuid.uuid4().hex[:8]}"
+    code = """
+OUTPUT_TABLE = "fixed"
 
-    class FixedValue(Aggregation):
-        OUTPUT_TABLE = output_table
-
-        async def combine(self, ctx, start_ts, end_ts):
-            return [{"timestamp": start_ts, "value": 42.0}]
-
+async def combine(ctx, start_ts, end_ts):
+    return [{"timestamp": start_ts, "value": 42.0}]
+"""
     worker = AggregationWorker(db)
-    agg = FixedValue()
-    await worker._run_one({"namespace": "default", "name": "fixed", "exchange": "test_ex", "agg": agg})
+    monkeypatch.setattr(worker, "_load_scripts", lambda: _async_value([(namespace, "fixed", code)]))
+    table = output_table_name(namespace, "fixed")
+    try:
+        await worker.run_once()
+        result = await db.fetch_from_unit_table(table, exchange=namespace)
+        assert result["value"].to_list() == [42.0]
+        assert worker.status[(namespace, "fixed")] is None
+    finally:
+        await db._execute(f"DROP TABLE IF EXISTS {table}")
 
-    result = await db.fetch_from_unit_table(output_table, exchange="test_ex")
-    assert result["value"].to_list() == [42.0]
+
+async def _async_value(value):
+    return value
 
 
-async def test_script_aggregation_equivalent_to_class(db):
+async def test_script_aggregation_equivalent_to_class(db, created_tables):
     """The dynamic path (ScriptAggregation, what a SaaS UI editor would create) must behave
     identically to hand-writing the same thing as an Aggregation subclass -- not just in
     theory (same combine_sql() interface) but against a real server end to end. Data is
@@ -310,6 +338,7 @@ async def test_script_aggregation_equivalent_to_class(db):
     btc_table = f"test_btc_{suffix}"
     eth_table = f"test_eth_{suffix}"
     output_table = f"test_spread_{suffix}"
+    created_tables += [btc_table, eth_table, output_table]
 
     await db._execute(f"CREATE TABLE {btc_table} (timestamp UInt64, close Float64) ENGINE=MergeTree ORDER BY timestamp")
     await db._execute(f"CREATE TABLE {eth_table} (timestamp UInt64, close Float64) ENGINE=MergeTree ORDER BY timestamp")
@@ -357,3 +386,100 @@ async def test_identifier_validation_blocks_injection_against_real_server(db):
     # connections table (created by other tests in this session) must be unaffected
     conns = await db.list_connections()
     assert conns is not None  # didn't raise -- table still exists
+
+_CANDLES_DDL = (
+    "CREATE TABLE IF NOT EXISTS candles (timestamp UInt64, exchange LowCardinality(String),"
+    " symbol LowCardinality(String), timeframe LowCardinality(String), open Float64, high Float64,"
+    " low Float64, close Float64, volume Float64) ENGINE = ReplacingMergeTree"
+    " ORDER BY (exchange, symbol, timeframe, timestamp)"
+)
+
+
+@pytest.fixture
+async def candles_market(db):
+    """A market of its own in `candles`: 5m rows from Sunday 2025-11-09 for ten days."""
+    created = not (await db._execute("EXISTS TABLE candles"))[0][0]
+    await db._execute(_CANDLES_DDL)
+    exchange = f"test_ex_{uuid.uuid4().hex[:8]}"
+    await db._execute(
+        "INSERT INTO candles SELECT 1762646400 + number * 300, %(ex)s, 'T', '5m', 1, 2, 0.5, 1.5, 1"
+        " FROM numbers(2880)",
+        {"ex": exchange},
+    )
+    try:
+        yield exchange
+    finally:
+        if created:
+            await db._execute("DROP TABLE IF EXISTS candles")
+        else:
+            await db._execute(
+                "ALTER TABLE candles DELETE WHERE exchange = %(ex)s SETTINGS mutations_sync = 1",
+                {"ex": exchange},
+            )
+
+
+async def test_builtin_bars_fold_from_the_market_base_timeframe(db, candles_market):
+    import time as _time
+
+    from tradingkit.core.resolver import DependencyResolver
+    from tradingkit.executor.local import LocalExecutor
+
+    resolver = DependencyResolver(db, executor=LocalExecutor())
+    await resolver._ensure_ohlcv_agg("15m", candles_market, "T")
+    bars = await db.fetch_data(candles_market, "T", "15m")
+    assert len(bars) == 960 and all(b["timestamp"] % 900 == 0 and b["volume"] == 3 for b in bars)
+
+    await resolver._ensure_ohlcv_agg("1w", candles_market, "T")
+    weeks = await db.fetch_data(candles_market, "T", "1w")
+    assert [_time.gmtime(w["timestamp"]).tm_wday for w in weeks] == [0, 0, 0]
+    assert sum(w["volume"] for w in weeks) == 2880
+
+    with pytest.raises(ValueError, match="multiple of 5m"):
+        await resolver._ensure_ohlcv_agg("7m", candles_market, "T")
+
+    await db.invalidate_derived(candles_market, "T", 1762646400, "5m")
+    assert await db.count_rows(candles_market, "T", "5m") == 2880
+    assert await db.count_rows(candles_market, "T", "15m") == 0
+
+
+async def test_combine_sql_aggregation_through_the_worker(db, monkeypatch):
+    from tradingkit.aggregation import AggregationWorker, output_table_name, query_aggregation
+
+    suffix = uuid.uuid4().hex[:8]
+    btc, eth, namespace = f"test_btc_{suffix}", f"test_eth_{suffix}", f"test_ns_{suffix}"
+    for table, price in ((btc, 50000.0), (eth, 3000.0)):
+        await db._execute(f"CREATE TABLE {table} (timestamp UInt64, close Float64) ENGINE=MergeTree ORDER BY timestamp")
+        await db._execute(f"INSERT INTO {table} VALUES (1000, {price})")
+    code = f'''
+OUTPUT_TABLE = "spread"
+SOURCES = {{"btc": SourceRef("{btc}", field="close"), "eth": SourceRef("{eth}", field="close")}}
+COMBINE_SQL = "btc - eth"
+'''
+    scripts = [(namespace, "spread", code)]
+
+    async def load():
+        return list(scripts)
+
+    worker = AggregationWorker(db, table_allowed=lambda t: t in (btc, eth))
+    monkeypatch.setattr(worker, "_load_scripts", load)
+    output = output_table_name(namespace, "spread")
+    mv_query = f"SELECT name FROM system.tables WHERE database = currentDatabase() AND position(name, '_to_{output}_') > 0"
+    try:
+        await worker.run_once()
+        assert worker.status[(namespace, "spread")] is None
+        agg = await worker.describe(namespace, code)
+        await db._execute(f"INSERT INTO {btc} VALUES (2000, 51000.0)")
+        await db._execute(f"INSERT INTO {eth} VALUES (2000, 3100.0)")
+        assert await query_aggregation(db, agg, 0, 9999) == [
+            {"timestamp": 1000, "value": 47000.0}, {"timestamp": 2000, "value": 47900.0},
+        ]
+        assert len(await db._execute(mv_query)) == 2
+
+        scripts.clear()
+        await worker.run_once()
+        assert await db._execute(mv_query) == []
+    finally:
+        for name, in await db._execute(mv_query):
+            await db._execute(f"DROP VIEW IF EXISTS {name}")
+        for table in (output, btc, eth):
+            await db._execute(f"DROP TABLE IF EXISTS {table}")

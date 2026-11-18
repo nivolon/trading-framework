@@ -42,9 +42,13 @@ AggregationScript   — NOT the same thing as Aggregation above, despite the nam
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
 import logging
+import re
 import time
 from abc import ABC
+from collections.abc import Callable
 from typing import Any, ClassVar
 
 import polars as pl
@@ -390,32 +394,172 @@ async def query_aggregation(
 
 
 # ---------------------------------------------------------------------------
+# Cross-source scripts in a worker: the host reads them as plain data
+# ---------------------------------------------------------------------------
+
+_OUTPUT_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,47}")
+_PL_TYPES = {
+    "Int64": pl.Int64, "UInt64": pl.UInt64, "Float64": pl.Float64, "Float32": pl.Float32,
+    "String": pl.String,
+}
+
+
+def output_table_prefix(namespace: str) -> str:
+    """The start of every output table of one project, and of no other project's."""
+    slug = re.sub(r"[^a-z0-9]+", "_", namespace.lower()).strip("_")[:24] or "default"
+    tag = hashlib.sha256(namespace.encode()).hexdigest()[:6]
+    return f"agg_{slug}_{tag}_"
+
+
+def output_table_name(namespace: str, output_table: str) -> str:
+    """The table a project's aggregation writes to.
+
+    Derived from the project as well as OUTPUT_TABLE, so two projects never share an
+    output, and a script can only ever name a table starting with `agg_`.
+    """
+    if not _OUTPUT_NAME_RE.fullmatch(output_table or ""):
+        raise ValueError(
+            f"OUTPUT_TABLE {output_table!r}: use lowercase letters, digits and _,"
+            " starting with a letter, at most 48 characters"
+        )
+    return output_table_prefix(namespace) + output_table
+
+
+def _plain(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    item = getattr(value, "item", None)
+    return item() if callable(item) else str(value)
+
+
+def describe_cross_source(code: str) -> dict:
+    """A cross-source script's declarations as plain data. Meant to run in a worker:
+    executor.call("tradingkit.aggregation:describe_cross_source")."""
+    agg = ScriptAggregation(code)
+    ns = agg._ns
+    schema = agg.output_schema()
+    return {
+        "output_table": str(ns.get("OUTPUT_TABLE") or ""),
+        "combine_sql": None if agg.combine_sql() is None else str(agg.combine_sql()),
+        "output_schema": {str(k): str(v) for k, v in schema.items()} if schema else None,
+        "source_filters": {str(k): _plain(v) for k, v in (ns.get("SOURCE_FILTERS") or {}).items()},
+        "sources": {
+            str(alias): {
+                "table": str(ref.table), "field": str(ref.field), "ch_type": str(ref.ch_type),
+                "filters": {str(k): _plain(v) for k, v in ref.filters.items()},
+            }
+            for alias, ref in agg.required_sources().items()
+        },
+        "has_combine": callable(ns.get("combine")),
+    }
+
+
+class _HostAggregationContext:
+    """`ctx` for combine() in a worker: query() asks the host, which decides what a script
+    may read."""
+
+    def __init__(self, host: Any, source_filters: dict) -> None:
+        self._host = host
+        self._source_filters = dict(source_filters or {})
+
+    async def query(
+        self, table: str, symbol: str | None = None,
+        start_ts: int | None = None, end_ts: int | None = None, **filters: Any,
+    ) -> pl.DataFrame:
+        if self._host is None:
+            raise RuntimeError("ctx.query() needs the host")
+        raw = self._host.request(
+            "rows", table=table, symbol=symbol, start_ts=start_ts, end_ts=end_ts,
+            filters={**self._source_filters, **{k: _plain(v) for k, v in filters.items()}},
+        )
+        return pl.read_ipc(io.BytesIO(raw)) if raw else pl.DataFrame()
+
+
+async def run_cross_source_combine(
+    code: str, start_ts: int, end_ts: int, source_filters: dict, host: Any = None,
+) -> list[dict]:
+    """Run a script's combine() and return its rows as plain data. Meant to run in a
+    worker: executor.call("tradingkit.aggregation:run_cross_source_combine")."""
+    rows = await ScriptAggregation(code).combine(_HostAggregationContext(host, source_filters), start_ts, end_ts)
+    if isinstance(rows, pl.DataFrame):
+        rows = rows.to_dicts()
+    return [{str(k): _plain(v) for k, v in row.items()} for row in rows or []]
+
+
+class DescribedAggregation(Aggregation):
+    """A cross-source script built from describe_cross_source(): the host sets it up and
+    reads it without running the script."""
+
+    def __init__(self, described: dict, output_table: str) -> None:
+        self._described = described
+        self._output_table = output_table
+        self.SOURCE_FILTERS = dict(described.get("source_filters") or {})
+
+    @property
+    def OUTPUT_TABLE(self) -> str:
+        return self._output_table
+
+    def required_sources(self) -> dict[str, SourceRef]:  # type: ignore[override]
+        return {alias: SourceRef(**ref) for alias, ref in self._described["sources"].items()}
+
+    def combine_sql(self) -> str | None:
+        return self._described.get("combine_sql")
+
+    def output_schema(self) -> dict[str, str] | None:
+        return self._described.get("output_schema")
+
+    def mv_names(self) -> set[str]:
+        """Materialized Views setup_aggregation() creates for this aggregation."""
+        if self.combine_sql() is None:
+            return set()
+        return {f"mv_{ref.table}_to_{self._output_table}_{alias}"
+                for alias, ref in self.required_sources().items()}
+
+
+# ---------------------------------------------------------------------------
 # AggregationWorker
 # ---------------------------------------------------------------------------
 
 class AggregationWorker:
     """
-    Background worker driving Aggregation/ScriptAggregation instances whose combine_sql()
-    is None — the ones combine_sql() covers need this worker exactly zero times, since
-    ClickHouse's own Materialized View mechanism keeps them current on every insert. As
-    more aggregations move to combine_sql(), this worker naturally has less to do each
-    cycle — that's an emergent property of the skip in _run_one(), not special-cased.
+    Keeps every cross-source aggregation script in plugin_library current.
 
-    Loads all scripts from plugin_library where type='aggregation' (skipping the
-    unrelated within-table aggregation(unit) scripts DataCollector already handles — see
-    AggregationScript.is_ch_mv()). Runs each combine_sql()-less one periodically, stores
-    results into OUTPUT_TABLE.
+    Scripts run in the executor's workers, never in this process: the host only receives
+    their declarations and their rows as plain data, and answers ctx.query() itself,
+    reading only tables `table_allowed` accepts. Each project's output goes to its own
+    table (output_table_name()).
 
-    Usage (app.py):
-        worker = AggregationWorker(db)
+    combine_sql() scripts get their Materialized Views installed once per version of the
+    code; MVs whose script is gone or changed are dropped. combine() scripts run every
+    `poll_interval` seconds over the rows that arrived since their last output.
+
+        worker = AggregationWorker(db, executor=executor, table_allowed=allowed)
         await worker.start()
         ...
         await worker.stop()
     """
 
-    def __init__(self, db: ClickHouseManager) -> None:
-        self._db    = db
+    def __init__(
+        self,
+        db: ClickHouseManager,
+        executor: Any = None,
+        table_allowed: Callable[[str], bool] | None = None,
+        poll_interval: float = _POLL_INTERVAL,
+    ) -> None:
+        if executor is None:
+            from tradingkit.executor.local import LocalExecutor
+            executor = LocalExecutor()
+        self._db = db
+        self._executor = executor
+        self._table_allowed = table_allowed or (lambda table: True)
+        self._poll_interval = poll_interval
         self._task: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
+        self._described: dict[str, dict] = {}      # code hash -> description
+        self._installed: dict[str, str] = {}       # output table -> code hash set up
+        self._mvs: dict[tuple[str, str], set[str]] = {}  # (namespace, name) -> its MVs
+        #: Last outcome per (namespace, name): None when it ran, else the error.
+        self.status: dict[tuple[str, str], str | None] = {}
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._run_loop(), name="aggregation-worker")
@@ -430,133 +574,194 @@ class AggregationWorker:
                 pass
         logger.info("AggregationWorker stopped")
 
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
-
     async def _run_loop(self) -> None:
         while True:
             try:
-                await self._run_all_scripts()
+                await self.run_once()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"AggregationWorker error: {e}")
             try:
-                await asyncio.sleep(_POLL_INTERVAL)
+                await asyncio.sleep(self._poll_interval)
             except asyncio.CancelledError:
                 break
 
-    async def _run_all_scripts(self) -> None:
-        """Load all cross-source Aggregation scripts from plugin_library and run each."""
-        scripts = await self._load_python_scripts()
-        for script_info in scripts:
+    async def run_once(self) -> None:
+        """One pass over every cross-source script, then drop orphaned MVs."""
+        async with self._lock:
+            await self._run_once()
+
+    async def drop_project(self, namespace: str) -> None:
+        """Remove a project's outputs: the MVs feeding them first, since ClickHouse refuses
+        inserts into a source whose MV has lost its table, then the tables. Call it once
+        the project's scripts are gone from plugin_library."""
+        prefix = output_table_prefix(namespace)
+        async with self._lock:
+            for name in await self._agg_mvs():
+                if f"_to_{prefix}" in name:
+                    await self._db._execute(f"DROP VIEW IF EXISTS {name}")
+            rows = await self._db._execute(
+                "SELECT name FROM system.tables WHERE database = currentDatabase()"
+                " AND startsWith(name, %(prefix)s)", {"prefix": prefix},
+            )
+            for (table,) in rows:
+                await self._db._execute(f"DROP TABLE IF EXISTS {table}")
+            self._installed = {t: d for t, d in self._installed.items() if not t.startswith(prefix)}
+            for key in [k for k in self._mvs if k[0] == namespace]:
+                del self._mvs[key]
+            for key in [k for k in self.status if k[0] == namespace]:
+                del self.status[key]
+
+    async def _run_once(self) -> None:
+        scripts = await self._load_scripts()
+        seen = set()
+        for namespace, name, code in scripts:
+            key = (namespace, name)
+            seen.add(key)
             try:
-                await self._run_one(script_info)
+                agg = await self.describe(namespace, code)
+                if agg.combine_sql() is not None:
+                    await self._install(agg, code)
+                    self._mvs[key] = agg.mv_names()
+                elif self._described[_code_hash(code)]["has_combine"]:
+                    self._mvs.pop(key, None)
+                    await self._combine(namespace, code, agg)
+                else:
+                    raise ValueError("The script defines neither COMBINE_SQL nor combine()")
+                self.status[key] = None
             except Exception as e:
-                logger.error(
-                    f"Aggregation script {script_info.get('name')!r} failed: {e}"
-                )
+                self.status[key] = str(e)
+                logger.error(f"Aggregation {namespace}/{name} failed: {e}")
+        for key in list(self._mvs):
+            if key not in seen:
+                del self._mvs[key]
+        for key in list(self.status):
+            if key not in seen:
+                del self.status[key]
+        await self._drop_orphaned_mvs(set().union(*self._mvs.values()) if self._mvs else set())
 
-    # ------------------------------------------------------------------
-    # Per-script execution
-    # ------------------------------------------------------------------
+    async def describe(self, namespace: str, code: str) -> DescribedAggregation:
+        """The script's declarations, read in a worker and cached per version of the code."""
+        digest = _code_hash(code)
+        if digest not in self._described:
+            self._described[digest] = await self._executor.call(
+                "tradingkit.aggregation:describe_cross_source", {"code": code},
+            )
+        described = self._described[digest]
+        agg = DescribedAggregation(described, output_table_name(namespace, described["output_table"]))
+        for alias, ref in agg.required_sources().items():
+            if not self._table_allowed(ref.table):
+                raise ValueError(f"Source {alias!r} reads table {ref.table!r}, which aggregations may not read")
+        return agg
 
-    async def _run_one(self, script_info: dict) -> None:
-        namespace = script_info.get("namespace", "default")
-        name      = script_info.get("name", "unknown")
-        agg: Aggregation = script_info["agg"]
+    async def _install(self, agg: DescribedAggregation, code: str) -> None:
+        table = agg.OUTPUT_TABLE
+        digest = _code_hash(code)
+        if self._installed.get(table) == digest:
+            return
+        aliases = set(agg.required_sources())
+        try:
+            columns = set(await self._db.get_table_schema(table)) - {"timestamp"}
+        except Exception:
+            columns = set()
+        if columns and columns != aliases:
+            # The sources changed: the alignment table has a column per source, so it is
+            # rebuilt; the backfill in setup_aggregation() refills it.
+            await self._drop_mvs_into(table)
+            await self._db._execute(f"DROP TABLE IF EXISTS {table}")
+        await setup_aggregation(self._db, agg)
+        self._installed[table] = digest
 
-        # `namespace` tags this aggregation's OUTPUT rows ("who computed this") and is read
-        # back by _get_last_ts, so the two stay consistent. It is deliberately NOT used to
-        # filter INPUT data any more: the two roles were one variable, which is why an
-        # aggregation in project "my_bot" searched source rows for exchange="my_bot".
-        # What to read is the aggregation's own declaration.
-        output_tag     = script_info.get("exchange", namespace)
-        source_filters = dict(getattr(agg, "SOURCE_FILTERS", {}) or {})
-
-        if agg.combine_sql() is not None:
-            return  # MV-driven — setup_aggregation() already installed it, nothing to poll
-
-        output_table = agg.OUTPUT_TABLE
-        now_ts  = int(time.time())
-        last_ts = await self._get_last_ts(output_table, output_tag)
-
-        if last_ts is None:
-            last_ts = 0  # first run: aggregate from the beginning
-
+    async def _combine(self, namespace: str, code: str, agg: DescribedAggregation) -> None:
+        table = agg.OUTPUT_TABLE
+        now_ts = int(time.time())
+        last_ts = await self._get_last_ts(table, namespace) or 0
         if now_ts <= last_ts:
-            return  # nothing new
-
-        ctx = AggregationContext(self._db, source_filters)
-        rows = await agg.combine(ctx, last_ts, now_ts)
+            return
+        rows = await self._executor.call(
+            "tradingkit.aggregation:run_cross_source_combine",
+            {"code": code, "start_ts": last_ts, "end_ts": now_ts, "source_filters": agg.SOURCE_FILTERS},
+            on_request=self.serve,
+        )
         if not rows:
             return
-
         df = pl.DataFrame(rows)
-
+        if "timestamp" not in df.columns:
+            raise ValueError("combine() rows need a 'timestamp'")
         schema = agg.output_schema()
         if schema:
-            _PL_MAP = {
-                "Int64":   pl.Int64,   "UInt64":  pl.UInt64,
-                "Float64": pl.Float64, "Float32": pl.Float32,
-                "String":  pl.String,
-            }
-            pl_schema = {k: _PL_MAP.get(v, pl.String) for k, v in schema.items()}
-            df = df.cast(pl_schema)
-
-        table_schema = dict(zip(df.columns, df.dtypes))
-        await self._db.ensure_raw_table(output_table, table_schema)
-        await self._db.insert_unit_batch(output_table, df, output_tag, "", "")
+            df = df.cast({k: _PL_TYPES.get(v, pl.String) for k, v in schema.items() if k in df.columns})
+        await self._db.ensure_raw_table(table, dict(zip(df.columns, df.dtypes)))
+        await self._db.insert_unit_batch(table, df, namespace, "", "")
         await self._db.flush()
-        logger.info(
-            f"AggregationWorker: {name!r} → {output_table} stored {len(rows)} rows"
+        logger.info(f"AggregationWorker: {namespace} → {table} stored {len(rows)} rows")
+
+    async def serve(self, ask: dict) -> bytes:
+        """Answer a script's ctx.query(): rows of a table `table_allowed` accepts, as
+        Arrow IPC. Pass it as `on_request` to run a script outside the worker."""
+        if ask.get("kind") != "rows":
+            raise ValueError(f"Unknown data request: {ask.get('kind')!r}")
+        table = str(ask.get("table") or "")
+        if not self._table_allowed(table):
+            raise ValueError(f"Aggregations may not read table {table!r}")
+        df = await self._db.fetch_from_unit_table(
+            table, symbol=ask.get("symbol"), start_ts=ask.get("start_ts"), end_ts=ask.get("end_ts"),
+            filters=ask.get("filters") or {},
         )
+        buffer = io.BytesIO()
+        df.write_ipc(buffer)
+        return buffer.getvalue()
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    async def _load_scripts(self) -> list[tuple[str, str, str]]:
+        """(namespace, name, code) of every cross-source script the users saved.
 
-    async def _load_python_scripts(self) -> list[dict]:
+        Within-table aggregation(unit) scripts share type='aggregation' but are folded at
+        query time instead, and the built-in templates are starting points, not jobs.
         """
-        Return all Aggregation instances from plugin_library that AREN'T within-table
-        aggregation(unit) scripts (AggregationScript.is_ch_mv() — a different mechanism
-        entirely, consumed by DataCollector, sharing the same type='aggregation' rows).
+        if not self._db._conn:
+            return []
+        rows = await self._db._execute(
+            "SELECT namespace, name, code FROM plugin_library FINAL WHERE type = 'aggregation'"
+        )
+        return [(ns, name, code) for ns, name, code in rows if not AggregationScript(code).is_ch_mv()]
 
-        Only what the user put in the library runs. BUILTIN_AGGREGATIONS are templates to
-        start from, not jobs: running them here made a fresh install poll tables nobody
-        had created.
-        """
-        results: list[dict] = []
+    async def _drop_mvs_into(self, table: str) -> None:
+        for name in await self._agg_mvs():
+            if f"_to_{table}_" in name:
+                await self._db._execute(f"DROP VIEW IF EXISTS {name}")
 
-        if self._db._conn:
-            rows = await self._db._execute(
-                "SELECT namespace, name, code FROM plugin_library FINAL"
-                " WHERE type = 'aggregation'"
-            )
-            for row in rows:
-                namespace, name, code = row[0], row[1], row[2]
-                if AggregationScript(code).is_ch_mv():
-                    continue
-                results.append({
-                    "namespace": namespace, "name": name,
-                    "agg": ScriptAggregation(code=code),
-                })
+    async def _drop_orphaned_mvs(self, keep: set[str]) -> None:
+        for name in await self._agg_mvs():
+            if name not in keep:
+                await self._db._execute(f"DROP VIEW IF EXISTS {name}")
+                logger.info(f"AggregationWorker: dropped {name}, its script is gone or changed")
+        # A table whose MVs were dropped is set up again if its script comes back.
+        self._installed = {t: d for t, d in self._installed.items()
+                           if any(f"_to_{t}_" in mv for mv in keep)}
 
-        return results
+    async def _agg_mvs(self) -> list[str]:
+        """Materialized Views writing into aggregation output tables (agg_*)."""
+        rows = await self._db._execute(
+            "SELECT name FROM system.tables WHERE database = currentDatabase()"
+            " AND engine = 'MaterializedView' AND startsWith(name, 'mv_') AND position(name, '_to_agg_') > 0"
+        )
+        return [r[0] for r in rows]
 
     async def _get_last_ts(self, table: str, exchange: str) -> int | None:
-        """Return max(timestamp) from output table, or None if table is empty/missing."""
+        """max(timestamp) of the rows this worker stored for `exchange`, None when none."""
         try:
             rows = await self._db._execute(
-                f"SELECT max(timestamp) FROM {table}"
-                " WHERE exchange = %(ex)s",
-                {"ex": exchange},
+                f"SELECT max(timestamp) FROM {table} WHERE exchange = %(ex)s", {"ex": exchange},
             )
-            val = rows[0][0] if rows else None
-            return int(val) if val else None
         except Exception:
             return None
+        val = rows[0][0] if rows else None
+        return int(val) if val else None
+
+
+def _code_hash(code: str) -> str:
+    return hashlib.sha256(code.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -678,8 +883,13 @@ __all__ = [
     "AggregationScript",
     "AggregationWorker",
     "ScriptAggregation",
+    "DescribedAggregation",
     "SourceRef",
     "describe_aggregation_spec",
+    "describe_cross_source",
+    "output_table_name",
+    "output_table_prefix",
+    "run_cross_source_combine",
     "load_aggregation_plugin",
     "query_aggregation",
     "setup_aggregation",

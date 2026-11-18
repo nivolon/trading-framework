@@ -507,7 +507,7 @@ class _ConnectionWorker:
             )
             await self._db.flush()
             if self._table == "candles":
-                await self._db.invalidate_derived(self._exchange, self._symbol, start_ts)
+                await self._db.invalidate_derived(self._exchange, self._symbol, start_ts, self._timeframe)
             if total > 1:
                 self._log.debug(
                     f"Batch {batch_num}/{total}: {row_count} rows "
