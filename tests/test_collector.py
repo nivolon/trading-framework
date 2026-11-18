@@ -499,3 +499,12 @@ async def test_data_collector_context_manager_starts_and_stops():
     async with DataCollector(db=db):
         assert db.ensured is True
     # __aexit__ must not raise even with zero active workers
+
+async def test_a_source_cannot_write_to_a_table_the_host_forbids():
+    db = FakeDb()
+    worker = _ConnectionWorker(
+        _make_conn(), db=db, source=FakeSource(), executor=FakeExecutor(),
+        table_allowed=lambda table: table.startswith("data_"),
+    )
+    stored = await worker._fetch_and_store(0, 600, 1, 1)
+    assert stored == 0 and db.inserted == []

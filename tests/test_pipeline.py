@@ -9,10 +9,10 @@ import pickle
 import polars as pl
 import pytest
 
+from tests._fixtures.sources import frame_script
 from tradingkit.indicator import ScriptIndicator
 from tradingkit.pipeline import Pipeline, PipelineResult, _gap_rows, _merge_rows
 from tradingkit.runner._safe_pickle import UnsafeUnpicklingError
-from tests._fixtures.sources import frame_script
 from tradingkit.source import DataSource, ScriptSource
 from tradingkit.strategy import ScriptStrategy, Signal
 
@@ -333,7 +333,7 @@ async def test_a_live_run_produces_the_same_signals_as_a_backtest():
     rows = [_bar(60 * i, float(i)) for i in range(6)]
     backtest = await _crossing_pipeline(TickingSource(rows)).run("BTC", 60, 0, 300)
     live = [s async for s in _crossing_pipeline(TickingSource(rows)).run_live("BTC", 60)]
-    fields = lambda s: {k: v for k, v in s.to_dict().items() if k != "gap_recovered"}  # noqa: E731
+    fields = lambda s: {k: v for k, v in s.to_dict().items() if k != "gap_recovered"}
     assert [fields(s) for s in live] == [fields(s) for s in backtest.signals]
     assert len(live) == 3
 

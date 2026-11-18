@@ -153,3 +153,9 @@ class _SqlMixin:
                 logger.debug(f"Inserted {len(rows)} rows into {table}")
             except Exception as e:
                 logger.error(f"Bulk insert into {table} failed: {e}")
+                reopen = getattr(self, "_reopen_native", None)
+                if reopen is not None:
+                    try:
+                        await reopen()
+                    except Exception as reopen_error:
+                        logger.error(f"ClickHouse native connection still unavailable: {reopen_error}")

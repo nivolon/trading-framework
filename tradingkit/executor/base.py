@@ -4,8 +4,8 @@ tradingkit.executor.base — PluginExecutor ABC.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Callable
-from typing import TYPE_CHECKING, Self
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Self
 
 import polars as pl
 
@@ -127,6 +127,41 @@ class PluginExecutor(ABC):
         """Run a vectorized strategy script over bars. Default: in-process."""
         from tradingkit.strategy import run_strategy_script
         return run_strategy_script(code, candles, params, name)
+
+    async def call(
+        self,
+        target: str,
+        kwargs: dict | None = None,
+        on_request: Callable[[dict], Awaitable[Any]] | None = None,
+        network: bool = False,
+    ) -> Any:
+        """Run a trusted function, `module:function`, and return its result. Default: in
+        this process on a thread; worker-based executors run it in a worker instead.
+        `on_request` answers what the function asks for through its `host` argument."""
+        import asyncio
+        import importlib
+        import inspect
+
+        loop = asyncio.get_running_loop()
+        module_name, _, func_name = target.partition(":")
+        func = getattr(importlib.import_module(module_name), func_name)
+
+        class _Host:
+            def request(self, kind: str, **args: Any) -> Any:
+                if on_request is None:
+                    raise RuntimeError("This task cannot request data")
+                future = asyncio.run_coroutine_threadsafe(on_request({"kind": kind, **args}), loop)
+                return future.result()
+
+        call_kwargs = dict(kwargs or {})
+        if "host" in inspect.signature(func).parameters:
+            call_kwargs["host"] = _Host()
+
+        def run() -> Any:
+            result = func(**call_kwargs)
+            return asyncio.run(result) if inspect.isawaitable(result) else result
+
+        return await asyncio.to_thread(run)
 
     async def open_sink(self, sink: Sink) -> SinkSession:
         """A long-lived handle on one sink instance. Default: in-process."""

@@ -8,6 +8,7 @@ from tradingkit.executor.launchers import (
 )
 from tradingkit.executor.local import LocalExecutor
 from tradingkit.executor.remote import RemoteExecutor
+from tradingkit.executor.sandbox import SandboxExecutor
 from tradingkit.executor.subprocess_ import SubprocessExecutor
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "PluginExecutor",
     "RemoteExecutor",
     "RunnerLauncher",
+    "SandboxExecutor",
     "SubprocessExecutor",
     "SubprocessRunnerLauncher",
     "auto_launcher",

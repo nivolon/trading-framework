@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import pickle
+from typing import ClassVar
 
 import aiohttp
 import polars as pl
@@ -93,8 +94,11 @@ async def test_a_list_result_becomes_a_dataframe():
 # Retries                                                              #
 # ------------------------------------------------------------------ #
 
+_BUSY = TransientSourceError("busy")
+
+
 class Flaky(DataSource):
-    def __init__(self, failures, error=TransientSourceError("busy")):
+    def __init__(self, failures, error=_BUSY):
         super().__init__({"retry_delay_s": 0, "max_retries": 3})
         self.failures = failures
         self.error = error
@@ -216,7 +220,7 @@ def test_live_support_follows_the_class():
 # ------------------------------------------------------------------ #
 
 class TwoStreams(DataSource):
-    streams = {
+    streams: ClassVar[dict] = {
         "candles": Stream(table="candles", step=60, columns={"timestamp": int, "close": float}),
         "trades":  Stream(table="trades", updates="append", history=False),
     }
@@ -420,7 +424,7 @@ class Ticking(DataSource):
     async for _ in stream:
         rows += 1
         if rows == 1:
-            session._proc.kill()
+            session._channel._process.kill()
         if "connected" in [e["event"] for e in events]:
             break
     await stream.aclose()
@@ -429,10 +433,10 @@ class Ticking(DataSource):
 
 
 async def test_worker_limits_compute_threads(monkeypatch):
-    from tradingkit.executor.source_worker import _worker_env
+    from tradingkit.executor.source_worker import worker_env
 
     monkeypatch.setenv("TRADINGKIT_SOURCE_WORKER_THREADS", "2")
-    env = _worker_env()
+    env = worker_env()
     assert env["POLARS_MAX_THREADS"] == "2" and env["OPENBLAS_NUM_THREADS"] == "2"
 
 
@@ -446,8 +450,7 @@ class S(DataSource):
 """
     session = await SubprocessExecutor().open_source(ScriptSource(code))
     first = (await session.fetch("BTC", 60, 0, 60))["pid"][0]
-    session._proc.kill()
-    await session._proc.wait()
+    session._channel._process.kill()
     await session._reader
     second = (await session.fetch("BTC", 60, 0, 60))["pid"][0]
     await session.close()

@@ -28,7 +28,7 @@ import polars as pl
 
 from tradingkit.core.plugin_runtime import PluginRuntime
 from tradingkit.core.script_ast import resolve_params
-from tradingkit.core.timeframe import UNIT_SCALE, parse_timeframe, seconds_to_tf_string
+from tradingkit.core.timeframe import parse_timeframe, seconds_to_tf_string
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +226,7 @@ class DataSource(PluginRuntime, ABC):
                     yield row
             except StopAsyncIteration:
                 reason = "connection closed"
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 reason = f"no data for {stale:.0f}s"
             except NotImplementedError:
                 raise

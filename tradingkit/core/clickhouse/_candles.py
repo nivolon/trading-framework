@@ -5,8 +5,8 @@ from typing import Any
 
 import polars as pl
 
-from tradingkit.core.timeframe import parse_timeframe, seconds_to_tf_string
 from tradingkit.core.clickhouse._sql import _validates_identifiers
+from tradingkit.core.timeframe import parse_timeframe, seconds_to_tf_string
 
 _OHLCV_SCHEMA = {
     "timestamp": pl.Int64,

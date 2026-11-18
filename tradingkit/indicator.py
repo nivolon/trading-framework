@@ -497,6 +497,77 @@ class CppIndicator(Indicator):
         return self.__dict__.copy()
 
 
+_OHLCV_SCHEMA = {"timestamp": pl.Int64, "open": pl.Float64, "high": pl.Float64,
+                 "low": pl.Float64, "close": pl.Float64, "volume": pl.Float64}
+
+
+class _HostQuery:
+    """`ctx.query(symbol, timeframe)` for preview scripts: candles of another market or
+    timeframe, served by the host through the worker channel."""
+
+    def __init__(self, host: Any, exchange: str) -> None:
+        self._host = host
+        self._exchange = exchange
+        self._cache: dict = {}
+
+    def query(self, symbol: str, timeframe: str, exchange: str | None = None) -> pl.DataFrame:
+        import io
+        key = ((exchange or self._exchange or "").lower(), (symbol or "").upper(), timeframe)
+        if key not in self._cache:
+            raw = None
+            if self._host is not None:
+                raw = self._host.request("candles", exchange=key[0], symbol=key[1], timeframe=timeframe)
+            self._cache[key] = pl.read_ipc(io.BytesIO(raw)) if raw else pl.DataFrame(schema=_OHLCV_SCHEMA)
+        return self._cache[key]
+
+
+def _preview_result(result: Any, timestamps: np.ndarray) -> dict:
+    if isinstance(result, pl.Series):
+        result = result.to_numpy()
+    if isinstance(result, (list, tuple)):
+        result = np.asarray(result, dtype=np.float64)
+    if isinstance(result, np.ndarray):
+        values = result.astype(np.float64, copy=False)
+        return {"type": "line", "data": [
+            [int(ts), float(v)] for ts, v in zip(timestamps, values) if not np.isnan(v)
+        ]}
+    if isinstance(result, pl.DataFrame):
+        columns = result.columns
+        if {"open", "high", "low", "close"}.issubset(columns):
+            return {"type": "ohlcv",
+                    "data": result.select(["timestamp", "open", "high", "low", "close"]).to_dicts()}
+        return {"type": "multi", "columns": [c for c in columns if c != "timestamp"],
+                "rows": result.to_dicts()}
+    return {"type": "line", "data": []}
+
+
+def preview_indicator_script(
+    code: str,
+    params: dict,
+    data: bytes,
+    symbol: str = "",
+    timeframe: str = "",
+    exchange: str = "",
+    host: Any = None,
+) -> dict:
+    """Run an editor indicator script over candles (Arrow IPC bytes) and return what a
+    chart draws. Meant to run in a worker, via executor.call(); `ctx.query()` asks the host."""
+    import io
+    df = pl.read_ipc(io.BytesIO(data)) if data else pl.DataFrame(schema=_OHLCV_SCHEMA)
+    column = lambda name, dtype: df[name].to_numpy() if len(df) else np.array([], dtype=dtype)
+    namespace: dict[str, Any] = {
+        "close": column("close", np.float64), "high": column("high", np.float64),
+        "low": column("low", np.float64), "open": column("open", np.float64),
+        "volume": column("volume", np.float64), "ts": column("timestamp", np.int64), "df": df,
+        "symbol": symbol, "timeframe": timeframe, "exchange": exchange,
+        "ta": _ta_ns, "np": np, "pl": pl, "ctx": _HostQuery(host, exchange),
+        "result": None,
+        **params,
+    }
+    exec(compile(code, "<indicator>", "exec"), namespace)  # noqa: S102
+    return _preview_result(namespace.get("result"), namespace["ts"])
+
+
 __all__ = [
     "IndicatorContext",
     "Indicator",
@@ -511,4 +582,5 @@ __all__ = [
     "_extract_defaults",
     "_make_talib_indicator",
     "load_indicator_plugin",
+    "preview_indicator_script",
 ]

@@ -7,8 +7,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from tradingkit.core.clickhouse import ClickHouseManager
-from tradingkit.core.timeframe import parse_timeframe
 from tradingkit.core.params import IndicatorParams, StrategyParams
+from tradingkit.core.timeframe import parse_timeframe
 
 if TYPE_CHECKING:
     from tradingkit.executor.base import PluginExecutor

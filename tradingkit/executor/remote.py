@@ -92,6 +92,11 @@ class RemoteExecutor(PluginExecutor):
         self._token = token
         self._session: Any = None
 
+    async def call(self, target, kwargs=None, on_request=None, network=False):
+        raise NotImplementedError(
+            "tradingkit-runner has no call endpoint; use SandboxExecutor to run scripts remotely"
+        )
+
     async def start(self) -> None:
         import aiohttp
         self._session = aiohttp.ClientSession(

@@ -34,7 +34,7 @@ def run_strategy_script(
     from tradingkit.core.script_ast import resolve_params
     from tradingkit.indicator import _ta_ns
 
-    column = lambda key: np.array([float(c[key]) for c in candles], dtype=np.float64)  # noqa: E731
+    column = lambda key: np.array([float(c[key]) for c in candles], dtype=np.float64)
     close = column("close")
     ts = np.array([int(c["timestamp"]) for c in candles], dtype=np.int64)
     signals: list[dict] = []

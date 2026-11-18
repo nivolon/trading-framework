@@ -7,52 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added
-- **`AggregationScript.fold()` builds bars of any timeframe at query time.** It reads the
-  script's `aggregation(unit)` folds against its `SOURCE_TABLE` and folds the market's
-  deduplicated base rows in ClickHouse (`fold_buckets()`, `Fold.ch_expr()`), so a custom
-  aggregation works for custom timeframes without per-bucket tables. `base_timeframe()`
-  finds the finest stored timeframe to fold from.
-- **`_execute(strict=True)` raises `ClickHouseQueryError`** with the server's message
-  instead of logging it and returning `[]`.
+## [0.6.0] - 2026-11-18
 
-### Fixed
-- **Query parameters accept lists and tuples**, rendered as escaped SQL tuples for `IN`.
-
-### Fixed
-- **Minute bars were stored under the connection's timeframe.** A source always writes
-  one-minute units, but `_ConnectionWorker` labelled them with `conn["timeframe"]`, so a
-  `1h` connection filled the `1h` label with 60s-spaced rows that charts drew as hourly
-  candles. Rows are now always labelled `1m`, a different requested timeframe logs a
-  warning, and higher timeframes come from aggregation as designed.
-- **`fetch_data()` could return one timestamp several times.** The live stream re-inserts
-  the forming bar, and without `FINAL` every unmerged row reached the caller.
-
-### Changed
-- **`AggregationWorker` runs only what is in `plugin_library`.** It used to fall back to
-  the host app's `BUILTIN_AGGREGATIONS`, so a fresh install ran templates nobody had added
-  and polled tables that did not exist. Builtins remain available as templates.
-
-### Fixed
-- **Gap recovery never filled a gap inside stored data.** `_batch_complete()` treated any
-  range between the oldest and newest row as complete, so a detected gap was skipped
-  without fetching. It now counts the rows actually stored.
-- **Gap detection mixed timeframes.** Aggregated bars share the `candles` table and hid
-  parts of a gap; `get_unit_range()` and `find_unit_gaps()` now filter on the timeframe.
-- **Bars and indicators stayed stale after a recovered gap.** Filling a gap now drops the
-  derived data from that point, and aggregation counts the closed bars exactly instead of
-  estimating. Aggregation also reads `FINAL`, so a forming bar's volume is not summed twice.
-- **Custom timeframes were treated as one minute.** `DependencyResolver` looked timeframes
-  up in a fixed table with a 60s fallback, so `7m` computed warmup and bucketing as `1m`.
-  It now uses `parse_timeframe()`.
-
-- **Built-in indicators computed nothing.** `fetch_ohlcv_aggregated()` filtered on
-  `timeframe = '60'` while rows are labelled `1m`, so the resolver always found no data.
-- **Indicators covered the oldest bars only.** The resolver fetched with the default limit
-  of 10000 in ascending order, so a longer history was cut off before the visible range.
-
-- **TA-Lib indicators could not run under `SubprocessExecutor`.** The class was defined
-  inside a function, so it could not be pickled.
+Plugins written by other people can run safely: a sandbox executor, plain-value worker
+replies and guarded data access. Sources become classes with named streams, and a new
+output plugin, `Sink`, delivers results.
 
 ### Changed
 - **Breaking: sources are classes only, with a new contract.** A source implements
@@ -62,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `max_reconnect_delay_s`) and treating a silent connection as dead (`stale_timeout_s`).
   The `historical()`/`realtime()` function style and the `result =` expression style are
   gone, as is overriding `get_historical_data()` and `stream()`.
+- **`AggregationWorker` runs only what is in `plugin_library`.** It used to fall back to
+  the host app's `BUILTIN_AGGREGATIONS`, so a fresh install ran templates nobody had added
+  and polled tables that did not exist. Builtins remain available as templates.
 - **`PluginExecutor.open_source()`** returns a `SourceSession`. Under `SubprocessExecutor`
   it is a long-lived worker process per connection: the plugin is set up once, streaming
   is isolated for the first time, and a dead worker is restarted.
@@ -75,15 +37,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   date collects live data only, with no backfill or gap recovery.
 - `DataCollector` reports `reconnecting` with the reason, and runs gap recovery as soon as
   a stream reconnects rather than at the next interval.
-
 - **Live runs see what a backtest sees.** `Pipeline.run_live()` used to call strategies on
   every update of the forming bar and started with no history. Bars now close by the clock
   (end plus `bar_close_delay_s`) from the exchange's own record, with `provisional=True` on
   signals when that record can't be had, and indicators are warmed up first.
 - `DataCollector` closes bars the same way, storing the official bar and calling
   `on_bar_closed`.
+- **The license is declared as the SPDX expression `BUSL-1.1`**, which setuptools 77+
+  requires; the old table form stops building in 2027.
 
 ### Added
+- **`SandboxExecutor` and the sandbox spawner (`python -m tradingkit.executor._spawner`).**
+  Every plugin runs in a worker started inside another container, each worker as its
+  own Unix user with memory, CPU-time, process and file-size limits, and every process
+  it leaves behind killed and its files deleted before the user is reused. Compute work
+  and sources/sinks go to separate spawners, so only the latter need a network.
+- **`executor.call("module:function", kwargs, on_request=...)`** runs a trusted function
+  in a worker; the function asks the host for data through its `host` argument instead
+  of holding database credentials. `preview_indicator_script()` and
+  `describe_aggregation_spec()` are built for it.
+- **`AggregationScript.fold()` builds bars of any timeframe at query time.** It reads the
+  script's `aggregation(unit)` folds against its `SOURCE_TABLE` and folds the market's
+  deduplicated base rows in ClickHouse (`fold_buckets()`, `Fold.ch_expr()`), so a custom
+  aggregation works for custom timeframes without per-bucket tables. `base_timeframe()`
+  finds the finest stored timeframe to fold from.
+- **`_execute(strict=True)` raises `ClickHouseQueryError`** with the server's message
+  instead of logging it and returning `[]`.
 - **`Sink` / `ScriptSink`**, the output plugin. `send()` makes one delivery; a long-lived
   connection opens in `setup()`. The framework retries and restores the connection, and
   `PluginExecutor.open_sink()` runs it in its own worker under `SubprocessExecutor`.
@@ -100,7 +79,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `options`, `min` and `max`. A host app can build a form from a script and keep the values
   outside its code.
 
+### Security
+- **Worker output is no longer unpickled.** A plugin runs in the same process that writes
+  the worker's reply, so it could forge a pickle that executed code in the host. Replies
+  now carry built-in values only and are decoded by `_wire.plain_loads()`, which never
+  imports or constructs a class.
+- **Fold arguments cannot read other data:** subqueries, joins, dictionaries and table
+  functions are rejected, and folding queries run with `readonly=2`.
+- **Sources cannot write to the host's tables.** A stream names its own table, so a
+  source could insert rows into `plugin_library` or any other table. `DataCollector`
+  takes `table_allowed(name)` and refuses every other table.
+
 ### Fixed
+- **`tradingkit.__version__` said `0.1.0`.** It now reads the installed package version.
+- **A failed insert reopens the native ClickHouse connection.** After ClickHouse
+  restarted, the connection was left holding an unread result and refused every insert
+  until the app was restarted.
+- **Query parameters accept lists and tuples**, rendered as escaped SQL tuples for `IN`.
+- **Minute bars were stored under the connection's timeframe.** A source always writes
+  one-minute units, but `_ConnectionWorker` labelled them with `conn["timeframe"]`, so a
+  `1h` connection filled the `1h` label with 60s-spaced rows that charts drew as hourly
+  candles. Rows are now always labelled `1m`, a different requested timeframe logs a
+  warning, and higher timeframes come from aggregation as designed.
+- **`fetch_data()` could return one timestamp several times.** The live stream re-inserts
+  the forming bar, and without `FINAL` every unmerged row reached the caller.
+- **Gap recovery never filled a gap inside stored data.** `_batch_complete()` treated any
+  range between the oldest and newest row as complete, so a detected gap was skipped
+  without fetching. It now counts the rows actually stored.
+- **Gap detection mixed timeframes.** Aggregated bars share the `candles` table and hid
+  parts of a gap; `get_unit_range()` and `find_unit_gaps()` now filter on the timeframe.
+- **Bars and indicators stayed stale after a recovered gap.** Filling a gap now drops the
+  derived data from that point, and aggregation counts the closed bars exactly instead of
+  estimating. Aggregation also reads `FINAL`, so a forming bar's volume is not summed twice.
+- **Custom timeframes were treated as one minute.** `DependencyResolver` looked timeframes
+  up in a fixed table with a 60s fallback, so `7m` computed warmup and bucketing as `1m`.
+  It now uses `parse_timeframe()`.
+- **Built-in indicators computed nothing.** `fetch_ohlcv_aggregated()` filtered on
+  `timeframe = '60'` while rows are labelled `1m`, so the resolver always found no data.
+- **Indicators covered the oldest bars only.** The resolver fetched with the default limit
+  of 10000 in ascending order, so a longer history was cut off before the visible range.
+- **TA-Lib indicators could not run under `SubprocessExecutor`.** The class was defined
+  inside a function, so it could not be pickled.
 - **`__params__` defaults were silently lost on indicators.** `_extract_defaults()` matched
   with a regex that stopped at the first `}`, so the documented nested declaration parsed
   to nothing. It now goes through `resolve_params()`.

@@ -4,10 +4,10 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
+from tests._fixtures.sources import frame_script
 from tradingkit.executor.local import LocalExecutor
 from tradingkit.executor.subprocess_ import SubprocessExecutor
 from tradingkit.indicator import CppIndicator, IndicatorContext, ScriptIndicator
-from tests._fixtures.sources import frame_script
 from tradingkit.source import ScriptSource
 from tradingkit.strategy import BarContext, ScriptStrategy
 

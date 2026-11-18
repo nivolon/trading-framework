@@ -343,6 +343,7 @@ async def test_fold_buckets_folds_deduplicated_base_rows_at_query_time(fake_ch_h
 
 async def test_fold_buckets_rejects_python_folds():
     import pytest
+
     from tradingkit.schema import DataUnit
     unit = DataUnit({"close": pl.Float64})
     with pytest.raises(ValueError, match="Python folds"):
@@ -373,6 +374,7 @@ async def test_fold_buckets_prefers_columns_over_fold_aliases(fake_ch_http):
 
 async def test_strict_execute_raises_the_server_message(fake_ch_http):
     import pytest
+
     from tradingkit.core.clickhouse import ClickHouseQueryError
     fake_ch_http._responses.append(FakeChResponse(status=400, text_data="Code: 184. ILLEGAL_AGGREGATION"))
     db = ClickHouseManager()
@@ -380,3 +382,19 @@ async def test_strict_execute_raises_the_server_message(fake_ch_http):
         await db._execute("SELECT 1", strict=True)
     fake_ch_http._responses.append(FakeChResponse(status=400, text_data="boom"))
     assert await db._execute("SELECT 1") == []
+
+
+async def test_a_failed_insert_reopens_the_native_connection():
+    class _Broken:
+        def cursor(self):
+            raise RuntimeError("some records have not been fetched")
+
+    db = ClickHouseManager()
+    db._conn = _Broken()
+    reopened = []
+
+    async def reopen():
+        reopened.append(True)
+    db._reopen_native = reopen
+    await db._bulk_insert("candles", ["timestamp"], [(1,)])
+    assert reopened == [True]

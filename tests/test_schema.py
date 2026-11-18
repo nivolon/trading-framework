@@ -159,8 +159,20 @@ def test_legit_sumif_condition_passes():
 
 def test_ch_expr_is_the_plain_aggregate_of_the_state_expression():
     import polars as pl
+
     from tradingkit.schema import DataUnit
     unit = DataUnit({"close": pl.Float64, "volume": pl.Float64})
     assert unit.close.last().alias("close").ch_expr("close") == "argMax(close, timestamp) AS close"
     assert unit.close.quantile(0.9).ch_expr("q") == "quantile(0.9)(close) AS q"
     assert unit.volume.sumIf("close > 0").ch_expr("up") == "sumIf(volume, close > 0) AS up"
+
+
+def test_fold_args_cannot_read_other_data():
+    import pytest
+
+    from tradingkit.schema import Fold
+    for arg in ["close > (SELECT max(close) FROM other)", "dictGet('d', 'x', 1) > 0",
+                "symbol IN ('A')", "length(currentUser()) > 0"]:
+        with pytest.raises(ValueError):
+            Fold("sumIf", "volume", "Float64", args=[arg])
+    assert Fold("sumIf", "volume", "Float64", args=["close > open AND (high - low) > 1"]).args

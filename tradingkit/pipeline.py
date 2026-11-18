@@ -362,7 +362,7 @@ class Pipeline:
                 else:
                     try:
                         updates = [await asyncio.wait_for(queue.get(), wait)]
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         updates = []
                     # Everything already received goes first: a bar must not close while
                     # its last update is still waiting in the queue.

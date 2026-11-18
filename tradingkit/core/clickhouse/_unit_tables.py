@@ -421,7 +421,7 @@ class _UnitTablesMixin:
             f"SELECT {', '.join(selects)} FROM {table_name} FINAL WHERE {where}"
             f" GROUP BY bucket ORDER BY bucket {order}{lim}",
             params,
-            settings={"prefer_column_name_to_alias": 1},
+            settings={"readonly": 2, "prefer_column_name_to_alias": 1},
             strict=True,
         )
         cols = ["timestamp"] + aliases

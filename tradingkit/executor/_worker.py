@@ -1,111 +1,149 @@
 """
-tradingkit.executor._worker — subprocess entry point.
+tradingkit.executor._worker — one-shot worker process.
 
-Reads a pickle payload from stdin, executes the task, writes pickle result to stdout.
-Memory limit applied via resource module (Unix only).
+Reads one framed task, runs it and writes one framed result. While it runs, the task can
+ask the host for data through HostLink.request(), which is how plugin code reaches data
+without database credentials of its own.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
+import inspect
 import pickle
 import struct
 import sys
 
-
-def _apply_memory_limit(mb: int) -> None:
-    try:
-        import resource
-        limit = mb * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-    except (ImportError, ValueError):
-        pass  # Windows or unprivileged environment
+_HEADER = struct.Struct(">I")
 
 
-async def _run_indicator(payload: dict) -> dict:
-    import numpy as np
+class HostLink:
+    """Requests from a task to the host that started it."""
+
+    def __init__(self, inp, out) -> None:
+        self._in = inp
+        self._out = out
+
+    def _read_exact(self, size: int) -> bytes:
+        chunks, remaining = [], size
+        while remaining:
+            chunk = self._in.read(remaining)
+            if not chunk:
+                raise EOFError("Host closed the channel")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def read_message(self):
+        size = _HEADER.unpack(self._read_exact(_HEADER.size))[0]
+        return pickle.loads(self._read_exact(size))
+
+    def send(self, message) -> None:
+        from tradingkit.executor._wire import plain_frame
+        self._out.write(plain_frame(message))
+        self._out.flush()
+
+    def request(self, kind: str, **args):
+        self.send({"request": {"kind": kind, **args}})
+        reply = self.read_message()
+        if "error" in reply:
+            raise RuntimeError(reply["error"])
+        return reply["response"]
+
+
+def _arrow_to_df(raw: bytes):
     import polars as pl
     import pyarrow as pa
+    return pl.from_arrow(pa.ipc.open_stream(pa.py_buffer(raw)).read_all())
 
-    indicator = pickle.loads(payload["indicator"])
 
-    buf = pa.py_buffer(payload["data"])
-    reader = pa.ipc.open_stream(buf)
-    df = pl.from_arrow(reader.read_all())
+def _df_to_arrow(df) -> bytes:
+    import pyarrow as pa
+    table = df.to_arrow()
+    sink = pa.BufferOutputStream()
+    writer = pa.ipc.new_stream(sink, table.schema)
+    writer.write_table(table)
+    writer.close()
+    return sink.getvalue().to_pybytes()
+
+
+async def _run_indicator(payload: dict, host: HostLink) -> dict:
+    import numpy as np
 
     from tradingkit.indicator import IndicatorContext
-    ctx = IndicatorContext(df)
-    series: pl.Series = indicator(ctx)
-    return {"values": series.to_numpy().astype(np.float64).tobytes()}
+    indicator = pickle.loads(payload["indicator"])
+    series = indicator(IndicatorContext(_arrow_to_df(payload["data"])))
+    return {"values": np.asarray(series.to_numpy(), dtype=np.float64).tobytes()}
 
 
-async def _run_strategy(payload: dict) -> dict:
+async def _run_strategy(payload: dict, host: HostLink) -> dict:
     strategy = pickle.loads(payload["strategy"])
-    bar = pickle.loads(payload["bar"])
-    signal = await strategy.on_bar(bar)
+    signal = await strategy.on_bar(pickle.loads(payload["bar"]))
     return {"signal": signal.to_dict() if signal is not None else None}
 
 
-async def _run_strategy_script(payload: dict) -> dict:
+async def _run_strategy_script(payload: dict, host: HostLink) -> dict:
     from tradingkit.strategy import run_strategy_script
     return {"signals": run_strategy_script(
         payload["code"], payload["candles"], payload["params"], payload["name"],
     )}
 
 
-async def _run_source(payload: dict) -> dict:
-    import polars as pl
-    import pyarrow as pa
-
+async def _run_source(payload: dict, host: HostLink) -> dict:
     source = pickle.loads(payload["source"])
-    df: pl.DataFrame = await source.get_historical_data(
-        symbol=payload["symbol"],
-        timeframe=payload["timeframe"],
-        start_ts=payload["start_ts"],
-        end_ts=payload["end_ts"],
-        limit=payload["limit"],
+    df = await source.get_historical_data(
+        symbol=payload["symbol"], timeframe=payload["timeframe"],
+        start_ts=payload["start_ts"], end_ts=payload["end_ts"], limit=payload["limit"],
     )
-    arrow_table = df.to_arrow()
-    sink = pa.BufferOutputStream()
-    writer = pa.ipc.new_stream(sink, arrow_table.schema)
-    writer.write_table(arrow_table)
-    writer.close()
-    return {"data": sink.getvalue().to_pybytes()}
+    return {"data": _df_to_arrow(df)}
+
+
+async def _run_call(payload: dict, host: HostLink) -> dict:
+    """Call a host-chosen function, `module:function`, with plain keyword arguments."""
+    module_name, _, func_name = payload["target"].partition(":")
+    func = getattr(importlib.import_module(module_name), func_name)
+    kwargs = dict(payload.get("kwargs") or {})
+    if "host" in inspect.signature(func).parameters:
+        kwargs["host"] = host
+    result = func(**kwargs)
+    if inspect.isawaitable(result):
+        result = await result
+    return {"value": result}
+
+
+_TASKS = {
+    "indicator": _run_indicator,
+    "strategy": _run_strategy,
+    "strategy_script": _run_strategy_script,
+    "source": _run_source,
+    "call": _run_call,
+}
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--memory-mb", type=int, default=512)
+    parser.add_argument("--cpu-s", type=int, default=0)
     args = parser.parse_args()
 
-    _apply_memory_limit(args.memory_mb)
+    from tradingkit.executor._wire import apply_limits, worker_stdio
+    apply_limits(args.memory_mb, args.cpu_s or None)
+    inp, out = worker_stdio()
+    host = HostLink(inp, out)
 
-    raw_stdin = sys.stdin.buffer.read()
-    if len(raw_stdin) < 4:
-        sys.exit(1)
-
-    payload_len = struct.unpack(">I", raw_stdin[:4])[0]
-    payload = pickle.loads(raw_stdin[4:4 + payload_len])
-
-    task = payload.get("task")
     try:
-        if task == "indicator":
-            result = await _run_indicator(payload)
-        elif task == "strategy":
-            result = await _run_strategy(payload)
-        elif task == "strategy_script":
-            result = await _run_strategy_script(payload)
-        elif task == "source":
-            result = await _run_source(payload)
-        else:
-            raise ValueError(f"Unknown task: {task!r}")
+        payload = host.read_message()
+    except EOFError:
+        sys.exit(1)
+    try:
+        task = _TASKS.get(payload.get("task"))
+        if task is None:
+            raise ValueError(f"Unknown task: {payload.get('task')!r}")
+        result = await task(payload, host)
     except Exception as exc:
         result = {"error": str(exc)}
-
-    raw = pickle.dumps(result)
-    sys.stdout.buffer.write(struct.pack(">I", len(raw)))
-    sys.stdout.buffer.write(raw)
-    sys.stdout.buffer.flush()
+    host.send({"result": result})
 
 
 if __name__ == "__main__":

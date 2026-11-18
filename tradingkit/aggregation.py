@@ -603,22 +603,28 @@ class AggregationScript:
         from tradingkit.schema import AggSpec
         ns: dict = {}
         exec(compile(self._code, "<aggregation_script>", "exec"), ns)  # noqa: S102
-        fn = ns.get("aggregation")
-        if not callable(fn):
+        if "aggregation" not in ns:
             raise ValueError("The script defines no aggregation(unit) function")
-        spec = fn(unit)
+        spec = ns["aggregation"](unit)
         if not isinstance(spec, AggSpec):
             raise TypeError(f"aggregation(unit) must return AggSpec, got {type(spec).__name__}")
         return spec
 
-    async def spec_for_table(self, db: Any) -> tuple[str, Any]:
-        """The source table and the AggSpec built from that table's columns."""
-        from tradingkit.schema import DataUnit
+    async def spec_for_table(self, db: Any, executor: Any = None) -> tuple[str, Any]:
+        """The source table and the AggSpec built from that table's columns. With an
+        executor, the script runs in one of its workers rather than in this process."""
+        from tradingkit.schema import AggSpec, DataUnit
         table = self.get_source_table() or "candles"
         schema = await db.get_table_schema(table)
         if not schema:
             raise ValueError(f"Source table {table!r} does not exist yet")
-        return table, self.spec_for_unit(DataUnit(schema))
+        if executor is None:
+            return table, self.spec_for_unit(DataUnit(schema))
+        described = await executor.call(
+            "tradingkit.aggregation:describe_aggregation_spec",
+            {"code": self._code, "schema": {col: str(dtype) for col, dtype in schema.items()}},
+        )
+        return table, AggSpec.from_plain(described)
 
     async def fold(
         self,
@@ -631,13 +637,14 @@ class AggregationScript:
         end_ts: int | None = None,
         limit: int | None = None,
         newest_first: bool = False,
+        executor: Any = None,
     ) -> list[dict]:
         """Bars of any `timeframe`, folded at query time from the market's stored rows.
 
         The timeframe must be a whole multiple of the finest stored timeframe.
         """
         from tradingkit.core.timeframe import parse_timeframe
-        table, spec = await self.spec_for_table(db)
+        table, spec = await self.spec_for_table(db, executor)
         base = await db.base_timeframe(table, exchange, symbol)
         if base is None:
             return []
@@ -648,6 +655,14 @@ class AggregationScript:
             table, spec.folds, bucket_s, exchange, symbol, base,
             start_ts=start_ts, end_ts=end_ts, limit=limit, newest_first=newest_first,
         )
+
+
+def describe_aggregation_spec(code: str, schema: dict[str, str]) -> dict:
+    """The AggSpec a script returns for a table schema, as plain data. Meant to run in a
+    worker: SubprocessExecutor.call("tradingkit.aggregation:describe_aggregation_spec")."""
+    from tradingkit.schema import DataUnit
+    dtypes = {col: getattr(pl, name, pl.String) for col, name in schema.items()}
+    return AggregationScript(code).spec_for_unit(DataUnit(dtypes)).to_plain()
 
 
 # Empty by default -- a host app can register its own via get_builtin_registry()
@@ -664,6 +679,7 @@ __all__ = [
     "AggregationWorker",
     "ScriptAggregation",
     "SourceRef",
+    "describe_aggregation_spec",
     "load_aggregation_plugin",
     "query_aggregation",
     "setup_aggregation",

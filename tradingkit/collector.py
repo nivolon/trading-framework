@@ -85,6 +85,7 @@ class _ConnectionWorker:
         *,
         executor:           Any = None,
         on_bar_closed:      Any = None,
+        table_allowed:      Any = None,
         concurrency:        int = _CONCURRENCY,
         gap_interval:       int = _GAP_INTERVAL,
         health_interval:    int = _HEALTH_INTERVAL,
@@ -95,6 +96,7 @@ class _ConnectionWorker:
     ) -> None:
         self._conn       = conn
         self._on_bar_closed = on_bar_closed
+        self._table_allowed = table_allowed
         self._db         = db
         self._source     = source
         self._live_feed  = live_feed
@@ -221,6 +223,8 @@ class _ConnectionWorker:
         """Idempotent DDL: create raw table + agg tables + MVs on first insert."""
         if self._tables_ready:
             return
+        if self._table_allowed is not None and not self._table_allowed(self._table):
+            raise PermissionError(f"Sources may not write to table {self._table!r}")
         schema = dict(zip(df.columns, df.dtypes))
         await self._db.ensure_raw_table(self._table, schema, self._stream.updates)
         if self._agg_script is not None and self._agg_script.is_ch_mv():
@@ -361,7 +365,7 @@ class _ConnectionWorker:
         that is exactly when rows have just gone missing."""
         try:
             await asyncio.wait_for(self._gap_wake.wait(), self._current_gap_interval())
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         self._gap_wake.clear()
 
@@ -578,15 +582,20 @@ class DataCollector:
         max_gap_interval:   int = _MAX_GAP_INTERVAL,
         stalled_threshold:  int = _STALLED_THRESHOLD,
         on_bar_closed:      Any = None,
+        table_allowed:      Any = None,
     ) -> None:
         self._db        = db
         self._live_feed = live_feed
+        #: `table_allowed(name) -> bool` decides which tables a source's stream may write
+        #: to. A stream names its own table, so a host running other people's sources
+        #: must keep them out of its own tables.
         #: Executor used to run source scripts. Defaults to in-process (LocalExecutor);
         #: pass SubprocessExecutor() to isolate user-submitted connection scripts.
         self._executor  = executor
         self._timing = {
             "executor": executor,
             "on_bar_closed": on_bar_closed,
+            "table_allowed": table_allowed,
             "concurrency": concurrency,
             "gap_interval": gap_interval,
             "health_interval": health_interval,

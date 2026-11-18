@@ -10,13 +10,12 @@ import io
 import logging
 import os
 import pickle
-import struct
-import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
 
+from tradingkit.executor._wire import Channel
 from tradingkit.executor.base import SourceSession
 
 if TYPE_CHECKING:
@@ -24,13 +23,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "_source_worker.py")
 _DEAD = object()
 _RESPAWN_DELAY_S = 1.0
 _STOP_TIMEOUT_S = 5.0
 
 
-def _worker_env() -> dict[str, str]:
+def worker_env() -> dict[str, str]:
     """Plugins do I/O, not number crunching, and every library sizing its thread pool to
     the machine exhausts the worker's address-space limit."""
     threads = os.getenv("TRADINGKIT_SOURCE_WORKER_THREADS", "1")
@@ -43,10 +41,10 @@ def _worker_env() -> dict[str, str]:
 
 
 class WorkerSourceSession(SourceSession):
-    def __init__(self, source: DataSource, max_memory_mb: int) -> None:
+    def __init__(self, source: DataSource, launch: Callable[[], Awaitable[Channel]]) -> None:
         super().__init__(source)
-        self._max_memory_mb = max_memory_mb
-        self._proc: asyncio.subprocess.Process | None = None
+        self._launch = launch
+        self._channel: Channel | None = None
         self._reader: asyncio.Task | None = None
         self._next_id = 0
         self._channels: dict[int, asyncio.Queue] = {}
@@ -55,32 +53,34 @@ class WorkerSourceSession(SourceSession):
 
     async def _ensure_started(self) -> None:
         async with self._start_lock:
-            if self._proc is not None and self._proc.returncode is None:
+            if self._channel is not None and self._channel.alive:
                 return
-            self._proc = await asyncio.create_subprocess_exec(
-                sys.executable, _WORKER_SCRIPT, f"--memory-mb={self._max_memory_mb}",
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                env=_worker_env(),
-            )
-            self._reader = asyncio.create_task(self._read_replies(self._proc))
+            if self._channel is not None:
+                await self._channel.close()
+            self._channel = await self._launch()
+            self._reader = asyncio.create_task(self._read_replies(self._channel))
             await self._request("init", source=pickle.dumps(self._source))
 
-    async def _read_replies(self, proc: asyncio.subprocess.Process) -> None:
+    async def _read_replies(self, worker: Channel) -> None:
         try:
             while True:
-                size = struct.unpack(">I", await proc.stdout.readexactly(4))[0]
-                message = pickle.loads(await proc.stdout.readexactly(size))
-                channel = self._channels.get(message["id"])
+                message = await worker.receive()
+                if not isinstance(message, dict):
+                    raise TypeError("Worker sent a malformed message")
+                channel = self._channels.get(message.get("id"))
                 if channel is not None:
                     channel.put_nowait(message)
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
+        except Exception as exc:
+            logger.error(f"Dropping a worker that broke the protocol: {exc}")
+        await worker.close()
         for channel in self._channels.values():
             channel.put_nowait(_DEAD)
 
     def _send(self, **message: Any) -> None:
-        raw = pickle.dumps(message)
-        self._proc.stdin.write(struct.pack(">I", len(raw)) + raw)
+        from tradingkit.executor._wire import frame
+        self._channel.write(frame(pickle.dumps(message)))
 
     def _open_channel(self) -> tuple[int, asyncio.Queue]:
         self._next_id += 1
@@ -92,7 +92,7 @@ class WorkerSourceSession(SourceSession):
         request_id, channel = self._open_channel()
         try:
             self._send(op=op, id=request_id, **fields)
-            await self._proc.stdin.drain()
+            await self._channel.drain()
             reply = await channel.get()
         finally:
             del self._channels[request_id]
@@ -155,7 +155,7 @@ class WorkerSourceSession(SourceSession):
                         return
             finally:
                 del self._channels[request_id]
-                if self._proc is not None and self._proc.returncode is None:
+                if self._channel is not None and self._channel.alive:
                     self._send(op="cancel", target=request_id)
 
             restarted = True
@@ -164,15 +164,15 @@ class WorkerSourceSession(SourceSession):
 
     async def close(self) -> None:
         self._closed = True
-        if self._proc is None or self._proc.returncode is not None:
+        if self._channel is None or not self._channel.alive:
             return
         self._send(op="stop")
-        try:
-            await asyncio.wait_for(self._proc.wait(), _STOP_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            logger.warning("Source worker did not stop, killing it")
-            self._proc.kill()
-            await self._proc.wait()
+        if self._reader is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(self._reader), _STOP_TIMEOUT_S)
+            except TimeoutError:
+                logger.warning("Source worker did not stop, killing it")
+        await self._channel.close()
         if self._reader is not None:
             await self._reader
 

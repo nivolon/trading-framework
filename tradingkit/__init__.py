@@ -31,6 +31,8 @@ Writing a strategy:
 
 # ── Indicator ────────────────────────────────────────────────────────
 # ── Aggregation ──────────────────────────────────────────────────────
+from importlib import metadata as _metadata
+
 from tradingkit.aggregation import (
     Aggregation,
     AggregationContext,
@@ -113,7 +115,10 @@ from tradingkit.strategy import (
     load_strategy_plugin,
 )
 
-__version__ = "0.1.0"
+try:
+    __version__ = _metadata.version("tradingkit-py")
+except _metadata.PackageNotFoundError:
+    __version__ = "0+unknown"
 
 __all__ = [
     # Indicator

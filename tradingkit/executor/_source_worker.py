@@ -16,15 +16,6 @@ import struct
 import sys
 
 
-def _apply_memory_limit(mb: int) -> None:
-    try:
-        import resource
-        limit = mb * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-    except (ImportError, ValueError):
-        pass
-
-
 class _Worker:
     def __init__(self, out) -> None:
         self._out = out
@@ -32,8 +23,8 @@ class _Worker:
         self._tasks: dict[int, asyncio.Task] = {}
 
     def _send(self, **message) -> None:
-        raw = pickle.dumps(message)
-        self._out.write(struct.pack(">I", len(raw)) + raw)
+        from tradingkit.executor._wire import plain_frame
+        self._out.write(plain_frame(message))
         self._out.flush()
 
     async def _init(self, msg: dict) -> None:
@@ -54,7 +45,7 @@ class _Worker:
         self._send(id=msg["id"], result=self._source.batch_gaps(msg["gaps"]))
 
     async def _stream(self, msg: dict) -> None:
-        on_event = lambda event: self._send(id=msg["id"], event=event)  # noqa: E731
+        on_event = lambda event: self._send(id=msg["id"], event=event)
         rows = self._source.stream(msg["symbol"], msg["timeframe"], on_event, msg["stream"])
         async for row in rows:
             self._send(id=msg["id"], row=row)
@@ -103,15 +94,15 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--memory-mb", type=int, default=2048)
     args = parser.parse_args()
-    _apply_memory_limit(args.memory_mb)
 
-    # A plugin's print() must not end up in the protocol stream.
-    out = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
-    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    from tradingkit.executor._wire import apply_limits, worker_stdio
+    apply_limits(args.memory_mb)
+    _, out = worker_stdio()
 
     loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader()
-    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
+    reader = asyncio.StreamReader(limit=2 ** 20)
+    inp = os.fdopen(os.dup(sys.stdin.fileno()), "rb", buffering=0)
+    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), inp)
     await _Worker(out).run(reader)
 
 

@@ -420,6 +420,7 @@ async def test_fold_builds_any_timeframe_from_the_script_folds():
 
 async def test_fold_rejects_a_timeframe_finer_than_the_stored_rows():
     import pytest
+
     from tradingkit.aggregation import AggregationScript
     with pytest.raises(ValueError, match="multiple"):
         await AggregationScript(_FOLD_SCRIPT).fold(_FoldDb(base="5m"), "whitebit", "BTC_USDT", "7m")
@@ -427,6 +428,29 @@ async def test_fold_rejects_a_timeframe_finer_than_the_stored_rows():
 
 async def test_fold_reports_a_script_without_aggregation():
     import pytest
+
     from tradingkit.aggregation import AggregationScript
     with pytest.raises(ValueError, match="aggregation"):
         await AggregationScript("X = 1").fold(_FoldDb(), "whitebit", "BTC_USDT", "5m")
+
+
+async def test_fold_can_take_the_spec_from_a_worker():
+    from tradingkit.aggregation import AggregationScript
+    from tradingkit.executor import SubprocessExecutor
+    db = _FoldDb()
+    await AggregationScript(_FOLD_SCRIPT).fold(
+        db, "whitebit", "BTC_USDT", "7m", executor=SubprocessExecutor(timeout_s=60),
+    )
+    assert db.calls[0]["aliases"] == ["open", "close"] and db.calls[0]["bucket_s"] == 420
+
+
+def test_agg_spec_round_trips_through_plain_values_and_is_revalidated():
+    import pytest
+
+    from tradingkit.aggregation import describe_aggregation_spec
+    from tradingkit.schema import AggSpec
+    plain = describe_aggregation_spec(_FOLD_SCRIPT, {"timestamp": "UInt64", "open": "Float64", "close": "Float64"})
+    assert AggSpec.from_plain(plain).to_plain() == plain
+    plain["folds"][0]["field"] = "open; DROP TABLE candles"
+    with pytest.raises(ValueError):
+        AggSpec.from_plain(plain)
