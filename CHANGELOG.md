@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Aggregations across markets name roles, not markets.** A script declares
+  `INPUTS = ["a", "b"]` and reads a role with `ctx.input("a", start_ts, end_ts)`;
+  `COMBINE_SQL` names the roles as columns (each input's `close`, or the column
+  `INPUT_FIELDS` gives). A run binds each role to a connection of the project: stored in
+  `plugin_library` as `INSTANCE_TYPE` (`{"script", "inputs"}`) under the run's name.
+  `AggregationWorker` computes every run into a table of its own
+  (`output_table_name(project, run)`), checks the inputs against `table_allowed`, and
+  serves `ctx.input()` only for the roles a run binds. New on the worker:
+  `describe_run()`, `connection_input()` and `drop_output()`. A script with `INPUTS`
+  is a template and never runs by itself; scripts without it run as before.
+- `AggregationContext(db, inputs={role: (table, filters)})` gives `ctx.input()` outside
+  the worker.
+- `tradingkit.collector.connection_storage()` and `ConnectionStorage`: the table a
+  connection writes and the filters that select its rows, read from the source's
+  declarations without running it. The collector uses it too.
+
 ## [0.6.0] - 2026-11-18
 
 Plugins written by other people can run safely: a sandbox executor, plain-value worker

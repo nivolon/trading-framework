@@ -16,6 +16,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Self
 
@@ -58,6 +59,49 @@ async def recover_gaps(
     for b in batch(gaps):
         results.append(await fetch(b["start_timestamp"], b["end_timestamp"]))
     return results
+
+
+# ---------------------------------------------------------------------------
+# Where a connection's rows live
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ConnectionStorage:
+    """The table a connection writes and the tags its rows carry there."""
+    table:         str
+    exchange:      str
+    symbol:        str
+    timeframe:     str
+    unit_interval: int     # step between rows, in the source's timestamp unit
+    stream_name:   str
+    stream:        Any
+
+    @property
+    def filters(self) -> dict:
+        """Equality filters that select exactly this connection's rows."""
+        return {"exchange": self.exchange, "symbol": self.symbol, "timeframe": self.timeframe}
+
+
+def connection_config(conn: dict) -> dict:
+    config = conn.get("config") or {}
+    return json.loads(config) if isinstance(config, str) else dict(config)
+
+
+def connection_storage(conn: dict, source: DataSource) -> ConnectionStorage:
+    """Rows carry the step their stream declares, whatever the connection asks for:
+    higher timeframes come from aggregation. A stream that declares none is a one-minute
+    one, in the source's own timestamp unit. Read from the source's declarations only, so
+    a ScriptSource is never executed for this."""
+    exchange = (conn.get("source") or "").replace(".py", "")
+    stream_name = source.resolve_stream(connection_config(conn).get("stream"))
+    stream = source.stream_spec(stream_name)
+    scale = UNIT_SCALE.get(source.timestamp_unit, 1)
+    unit_interval = stream.step or 60 * scale
+    return ConnectionStorage(
+        table=stream.table or f"unit_{exchange}", exchange=exchange,
+        symbol=conn.get("symbol", ""), timeframe=seconds_to_tf_string(unit_interval // scale),
+        unit_interval=unit_interval, stream_name=stream_name, stream=stream,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -110,20 +154,14 @@ class _ConnectionWorker:
         self._session: Any = None
         self._gap_wake = asyncio.Event()
 
-        self._exchange  = (conn.get("source") or "").replace(".py", "")
-        self._symbol    = conn.get("symbol", "")
-
-        hist_cfg = json.loads(conn.get("config", "{}")) if isinstance(conn.get("config"), str) \
-                   else conn.get("config", {})
-
-        # Rows carry the step their stream declares, whatever the connection asks for:
-        # higher timeframes come from aggregation. A stream that declares none is a
-        # one-minute one, in the source's own timestamp unit.
-        self._stream_name = source.resolve_stream(hist_cfg.get("stream"))
-        self._stream = source.stream_spec(self._stream_name)
-        scale = UNIT_SCALE.get(source.timestamp_unit, 1)
-        self._unit_interval: int = self._stream.step or 60 * scale
-        self._timeframe = seconds_to_tf_string(self._unit_interval // scale)
+        hist_cfg = connection_config(conn)
+        storage = connection_storage(conn, source)
+        self._exchange = storage.exchange
+        self._symbol = storage.symbol
+        self._stream_name = storage.stream_name
+        self._stream = storage.stream
+        self._unit_interval: int = storage.unit_interval
+        self._timeframe = storage.timeframe
         if conn.get("timeframe", self._timeframe) != self._timeframe:
             logger.warning(
                 f"Connection {conn.get('name')!r}: timeframe {conn['timeframe']!r} ignored, "
@@ -153,7 +191,7 @@ class _ConnectionWorker:
         self._tasks: list[asyncio.Task] = []
 
         # DataUnit table state (initialized on first insert)
-        self._table: str        = self._stream.table or f"unit_{self._exchange}"
+        self._table: str        = storage.table
         self._folds: list       = []
         self._tables_ready: bool = False
 
@@ -272,7 +310,12 @@ class _ConnectionWorker:
                     self.progress["total_stored"] += n
 
         await asyncio.gather(*[_run(*b) for b in batches])
-        self.progress["status"] = "streaming" if self._source.has_live() else "complete"
+        # History that failed outright (an unknown symbol, say) is an error, not "live": a
+        # live stream for such a symbol may connect and then never send a row.
+        if total and not self.progress["total_stored"] and self.progress["error"]:
+            self.progress["status"] = "error"
+        else:
+            self.progress["status"] = "streaming" if self._source.has_live() else "complete"
         self._log.info(f"Backfill done: {self.progress['total_stored']} rows stored")
 
     # ------------------------------------------------------------------ #
@@ -281,7 +324,8 @@ class _ConnectionWorker:
 
     async def _stream_realtime(self) -> None:
         import polars as pl
-        self.progress["status"] = "streaming"
+        if self.progress["status"] != "error":
+            self.progress["status"] = "streaming"
         self._log.info(f"Starting realtime stream for {self._symbol}/{self._timeframe}")
         try:
             session = await self._open_session()
@@ -291,6 +335,8 @@ class _ConnectionWorker:
             )
             async for row in stream:
                 self._last_row_ts = time.time()
+                if self.progress["status"] == "error":
+                    self.progress["status"], self.progress["error"] = "streaming", None
                 df = pl.DataFrame([row])
                 await self._ensure_tables(df)
                 await self._db.insert_unit_batch(
@@ -516,6 +562,7 @@ class _ConnectionWorker:
             return row_count
         except Exception as e:
             self._log.error(f"Batch {batch_num}/{total} failed: {e}")
+            self.progress["error"] = str(e)
             return 0
 
     async def _batch_complete(self, start_ts: int, end_ts: int) -> bool:
@@ -710,4 +757,4 @@ class DataCollector:
             logger.error(f"DataCollector: failed to start {name}: {e}")
 
 
-__all__ = ["DataCollector"]
+__all__ = ["ConnectionStorage", "DataCollector", "connection_config", "connection_storage"]

@@ -508,3 +508,22 @@ async def test_a_source_cannot_write_to_a_table_the_host_forbids():
     )
     stored = await worker._fetch_and_store(0, 600, 1, 1)
     assert stored == 0 and db.inserted == []
+
+
+async def test_history_that_fails_outright_is_an_error_not_live():
+    """An unknown symbol fails every history request, and its live stream may connect and
+    then stay silent: the connection reported "streaming" with nothing in it."""
+    class FailingSession(SourceSession):
+        async def fetch(self, *args, **kwargs):
+            raise ValueError("Binance: Invalid symbol. (SOL_USTD)")
+
+    class FailingExecutor(FakeExecutor):
+        async def open_source(self, source):
+            return FailingSession(source)
+
+    worker = _ConnectionWorker(_make_conn(start_date="2026-01-01"), db=FakeDb(),
+                               source=FakeSource(), executor=FailingExecutor())
+    worker._safe_end = lambda: worker._parse_start_ts() + 1800
+    await worker._backfill()
+    assert worker.progress["status"] == "error"
+    assert "Invalid symbol" in worker.progress["error"]

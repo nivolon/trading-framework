@@ -197,7 +197,7 @@ async def test_worker_does_not_run_builtins_nobody_added(monkeypatch):
         async def _execute(self, sql, params=None):
             return []
 
-    assert await AggregationWorker(_EmptyLibrary())._load_scripts() == []
+    assert await AggregationWorker(_EmptyLibrary())._load_rows() == []
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +245,16 @@ async def test_aggregation_context_per_query_filter_overrides_declared():
     ctx = AggregationContext(db, {"exchange": "whitebit"})
     await ctx.query("candles", exchange="binance", timeframe="1m")
     assert db.calls[0]["filters"] == {"exchange": "binance", "timeframe": "1m"}
+
+
+async def test_aggregation_context_input_reads_the_bound_connection():
+    db = _RecordingDb()
+    ctx = AggregationContext(db, inputs={"a": ("candles", {"exchange": "wb", "symbol": "ETH_USDT", "timeframe": "1m"})})
+    await ctx.input("a", 1, 2)
+    assert db.calls[0]["filters"] == {"exchange": "wb", "symbol": "ETH_USDT", "timeframe": "1m"}
+    assert (db.calls[0]["start_ts"], db.calls[0]["end_ts"]) == (1, 2)
+    with pytest.raises(KeyError, match="No input 'b'"):
+        await ctx.input("b")
 
 
 # ---------------------------------------------------------------------------

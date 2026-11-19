@@ -292,9 +292,13 @@ class _UnitTablesMixin:
         start_ts: int | None = None,
         end_ts:   int | None = None,
         filters: dict | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> pl.DataFrame:
         """
         Generic SELECT * FROM any raw unit table with optional identity/time filters.
+        Oldest first; `newest_first` with `limit` keeps the latest rows instead, still
+        returned oldest first.
         Returns a Polars DataFrame. Used by AggregationContext.query().
 
         `exchange` is optional: it used to be mandatory, which meant a caller with no
@@ -324,10 +328,14 @@ class _UnitTablesMixin:
         # Every filter is optional now, so the WHERE clause itself has to be -- previously
         # `exchange` was mandatory and there was always at least one part.
         where = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
-        sql = f"SELECT * FROM {table_name}{where} ORDER BY timestamp ASC"
+        sql = f"SELECT * FROM {table_name}{where} ORDER BY timestamp {'DESC' if newest_first else 'ASC'}"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
         rows = await self._execute(sql, params)
         if not rows:
             return pl.DataFrame()
+        if newest_first:
+            rows = list(reversed(rows))
         schema = await self.get_table_schema(table_name)
         col_names = list(schema.keys())
         return pl.DataFrame(

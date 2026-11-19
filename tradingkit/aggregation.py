@@ -42,8 +42,10 @@ AggregationScript   — NOT the same thing as Aggregation above, despite the nam
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import io
+import json
 import logging
 import re
 import time
@@ -58,6 +60,10 @@ from tradingkit.core.clickhouse import ClickHouseManager
 logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL = 60  # seconds between AggregationWorker runs
+
+#: plugin_library type of a run: a script with INPUTS bound to connections, stored as
+#: {"script": <file name>, "inputs": {role: connection name}} under the run's name.
+INSTANCE_TYPE = "aggregation_instance"
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +83,13 @@ class AggregationContext:
         joined = btc.join(eth, on="timestamp", suffix="_eth")
     """
 
-    def __init__(self, db: ClickHouseManager, source_filters: dict | None = None) -> None:
+    def __init__(
+        self, db: ClickHouseManager, source_filters: dict | None = None,
+        inputs: dict[str, tuple[str, dict]] | None = None,
+    ) -> None:
         self._db = db
+        #: role -> (table, filters) of the connection bound to it, see Aggregation.INPUTS.
+        self._inputs = dict(inputs or {})
         #: Default equality filters applied to every query() — declared by the aggregation
         #: (Aggregation.SOURCE_FILTERS), not inferred. This used to be a single `exchange`
         #: string that the worker filled in from the *project namespace*, so a project
@@ -108,6 +119,16 @@ class AggregationContext:
         return await self._db.fetch_from_unit_table(
             table, symbol=symbol, start_ts=start_ts, end_ts=end_ts, filters=merged
         )
+
+    async def input(
+        self, role: str, start_ts: int | None = None, end_ts: int | None = None, warmup: int = 0,
+    ) -> pl.DataFrame:
+        """Rows of the connection bound to `role`, one of the aggregation's INPUTS.
+        `warmup` adds that many rows from before start_ts, for rolling windows."""
+        if role not in self._inputs:
+            raise KeyError(f"No input {role!r}; this run binds {sorted(self._inputs)}")
+        table, filters = self._inputs[role]
+        return await read_input(self._db, table, filters, start_ts, end_ts, warmup)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +191,16 @@ class Aggregation(ABC):
     #: filters instead.
     SOURCE_FILTERS: ClassVar[dict] = {}
 
+    #: Roles the aggregation reads, e.g. ["a", "b"], instead of naming markets in code.
+    #: A run binds each role to a connection of the project, so one script serves any
+    #: pair of markets; combine() reads a role with ctx.input("a", start_ts, end_ts), and
+    #: COMBINE_SQL names the roles as columns (the bound rows' INPUT_FIELDS, default close).
+    INPUTS: ClassVar[list[str]] = []
+    INPUT_FIELDS: ClassVar[dict[str, str]] = {}
+
+    def inputs(self) -> list[str]:
+        return list(self.INPUTS)
+
     @classmethod
     def required_sources(cls) -> dict[str, SourceRef]:
         """Auto-collect all SourceRef class attributes — same __mro__/vars() scan as
@@ -223,9 +254,11 @@ class ScriptAggregation(Aggregation):
         COMBINE_SQL = "btc - eth"
     """
 
-    def __init__(self, code: str, config: dict | None = None) -> None:
+    def __init__(self, code: str, config: dict | None = None, params: dict | None = None) -> None:
         self._code = code
         self.config = config or {}
+        #: A run's values for the script's __params__; defaults fill the rest.
+        self.params = dict(params or {})
         self._exec_ns()
 
     def _exec_ns(self) -> None:
@@ -234,7 +267,10 @@ class ScriptAggregation(Aggregation):
         # a valid aggregation script has no forward references to values injected later
         # (SourceRef is injected up front, not deferred), so a failure here means the
         # script itself is broken and should fail loudly.
-        self._ns: dict[str, Any] = {"SourceRef": SourceRef}
+        from tradingkit.core.script_ast import resolve_params, script_params
+        declared = script_params(self._code)
+        values = {k: v for k, v in resolve_params(self._code, self.params).items() if k in declared}
+        self._ns: dict[str, Any] = {"SourceRef": SourceRef, **values}
         exec(compile(self._code, "<aggregation_script>", "exec"), self._ns)  # noqa: S102
 
     def __getstate__(self) -> dict:
@@ -257,6 +293,10 @@ class ScriptAggregation(Aggregation):
 
     def combine_sql(self) -> str | None:
         return self._ns.get("COMBINE_SQL")
+
+    def inputs(self) -> list[str]:
+        declared = self._ns.get("INPUTS") or []
+        return [str(role) for role in (declared.keys() if isinstance(declared, dict) else declared)]
 
     def output_schema(self) -> dict[str, str] | None:
         return self._ns.get("OUTPUT_SCHEMA")
@@ -432,13 +472,22 @@ def _plain(value: Any) -> Any:
     return item() if callable(item) else str(value)
 
 
+_ROLE_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+
+
 def describe_cross_source(code: str) -> dict:
     """A cross-source script's declarations as plain data. Meant to run in a worker:
     executor.call("tradingkit.aggregation:describe_cross_source")."""
     agg = ScriptAggregation(code)
     ns = agg._ns
     schema = agg.output_schema()
+    inputs = agg.inputs()
+    for role in inputs:
+        if not _ROLE_RE.fullmatch(role):
+            raise ValueError(f"INPUTS role {role!r}: use lowercase letters, digits and _, starting with a letter")
     return {
+        "inputs": inputs,
+        "input_fields": {str(k): str(v) for k, v in (ns.get("INPUT_FIELDS") or {}).items()},
         "output_table": str(ns.get("OUTPUT_TABLE") or ""),
         "combine_sql": None if agg.combine_sql() is None else str(agg.combine_sql()),
         "output_schema": {str(k): str(v) for k, v in schema.items()} if schema else None,
@@ -452,6 +501,21 @@ def describe_cross_source(code: str) -> dict:
         },
         "has_combine": callable(ns.get("combine")),
     }
+
+
+async def read_input(
+    db: Any, table: str, filters: dict, start_ts: int | None, end_ts: int | None, warmup: int = 0,
+) -> pl.DataFrame:
+    """A bound input's rows from start_ts to end_ts, after the `warmup` rows before them."""
+    rows = await db.fetch_from_unit_table(table, start_ts=start_ts, end_ts=end_ts, filters=filters)
+    if not warmup or not start_ts:
+        return rows
+    earlier = await db.fetch_from_unit_table(
+        table, end_ts=start_ts - 1, filters=filters, limit=warmup, newest_first=True,
+    )
+    if earlier.is_empty():
+        return rows
+    return earlier if rows.is_empty() else pl.concat([earlier, rows], how="diagonal_relaxed")
 
 
 class _HostAggregationContext:
@@ -474,13 +538,23 @@ class _HostAggregationContext:
         )
         return pl.read_ipc(io.BytesIO(raw)) if raw else pl.DataFrame()
 
+    async def input(
+        self, role: str, start_ts: int | None = None, end_ts: int | None = None, warmup: int = 0,
+    ) -> pl.DataFrame:
+        if self._host is None:
+            raise RuntimeError("ctx.input() needs the host")
+        raw = self._host.request("input", role=str(role), start_ts=start_ts, end_ts=end_ts, warmup=int(warmup))
+        return pl.read_ipc(io.BytesIO(raw)) if raw else pl.DataFrame()
+
 
 async def run_cross_source_combine(
     code: str, start_ts: int, end_ts: int, source_filters: dict, host: Any = None,
+    params: dict | None = None,
 ) -> list[dict]:
     """Run a script's combine() and return its rows as plain data. Meant to run in a
     worker: executor.call("tradingkit.aggregation:run_cross_source_combine")."""
-    rows = await ScriptAggregation(code).combine(_HostAggregationContext(host, source_filters), start_ts, end_ts)
+    script = ScriptAggregation(code, params=params)
+    rows = await script.combine(_HostAggregationContext(host, source_filters), start_ts, end_ts)
     if isinstance(rows, pl.DataFrame):
         rows = rows.to_dicts()
     return [{str(k): _plain(v) for k, v in row.items()} for row in rows or []]
@@ -490,9 +564,14 @@ class DescribedAggregation(Aggregation):
     """A cross-source script built from describe_cross_source(): the host sets it up and
     reads it without running the script."""
 
-    def __init__(self, described: dict, output_table: str) -> None:
+    def __init__(
+        self, described: dict, output_table: str, inputs: dict | None = None, params: dict | None = None,
+    ) -> None:
         self._described = described
         self._output_table = output_table
+        self.params = dict(params or {})
+        #: role -> (table, filters): what a run of a script with INPUTS is bound to.
+        self.bound_inputs = dict(inputs or {})
         self.SOURCE_FILTERS = dict(described.get("source_filters") or {})
 
     @property
@@ -500,6 +579,10 @@ class DescribedAggregation(Aggregation):
         return self._output_table
 
     def required_sources(self) -> dict[str, SourceRef]:  # type: ignore[override]
+        if self.bound_inputs:
+            fields = self._described.get("input_fields") or {}
+            return {role: SourceRef(table, field=fields.get(role, "close"), filters=filters)
+                    for role, (table, filters) in self.bound_inputs.items()}
         return {alias: SourceRef(**ref) for alias, ref in self._described["sources"].items()}
 
     def combine_sql(self) -> str | None:
@@ -545,6 +628,7 @@ class AggregationWorker:
         executor: Any = None,
         table_allowed: Callable[[str], bool] | None = None,
         poll_interval: float = _POLL_INTERVAL,
+        max_warmup: int = 100_000,
     ) -> None:
         if executor is None:
             from tradingkit.executor.local import LocalExecutor
@@ -553,6 +637,7 @@ class AggregationWorker:
         self._executor = executor
         self._table_allowed = table_allowed or (lambda table: True)
         self._poll_interval = poll_interval
+        self._max_warmup = max_warmup
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._described: dict[str, dict] = {}      # code hash -> description
@@ -614,25 +699,36 @@ class AggregationWorker:
                 del self.status[key]
 
     async def _run_once(self) -> None:
-        scripts = await self._load_scripts()
+        rows = await self._load_rows()
+        scripts = {(ns, name): code for ns, type_, name, code in rows if type_ == "aggregation"}
         seen = set()
-        for namespace, name, code in scripts:
+        for (namespace, name), code in scripts.items():
+            key = (namespace, name)
+            try:
+                described = await self._describe_code(code)
+                if described["inputs"]:
+                    continue  # a template: it runs once per run that binds its inputs
+                seen.add(key)
+                await self._run_job(key, code, await self.describe(namespace, code))
+            except Exception as e:
+                seen.add(key)
+                self.status[key] = str(e)
+                logger.error(f"Aggregation {namespace}/{name} failed: {e}")
+        for namespace, type_, name, spec_json in rows:
+            if type_ != INSTANCE_TYPE:
+                continue
             key = (namespace, name)
             seen.add(key)
             try:
-                agg = await self.describe(namespace, code)
-                if agg.combine_sql() is not None:
-                    await self._install(agg, code)
-                    self._mvs[key] = agg.mv_names()
-                elif self._described[_code_hash(code)]["has_combine"]:
-                    self._mvs.pop(key, None)
-                    await self._combine(namespace, code, agg)
-                else:
-                    raise ValueError("The script defines neither COMBINE_SQL nor combine()")
-                self.status[key] = None
+                spec = json.loads(spec_json)
+                code = scripts.get((namespace, spec.get("script", "")))
+                if code is None:
+                    raise ValueError(f"Its script {spec.get('script')!r} is gone")
+                agg = await self.describe_run(namespace, name, code, spec.get("inputs") or {}, spec.get("params") or {})
+                await self._run_job(key, code, agg)
             except Exception as e:
                 self.status[key] = str(e)
-                logger.error(f"Aggregation {namespace}/{name} failed: {e}")
+                logger.error(f"Aggregation run {namespace}/{name} failed: {e}")
         for key in list(self._mvs):
             if key not in seen:
                 del self._mvs[key]
@@ -641,14 +737,78 @@ class AggregationWorker:
                 del self.status[key]
         await self._drop_orphaned_mvs(set().union(*self._mvs.values()) if self._mvs else set())
 
-    async def describe(self, namespace: str, code: str) -> DescribedAggregation:
-        """The script's declarations, read in a worker and cached per version of the code."""
+    async def _run_job(self, key: tuple[str, str], code: str, agg: DescribedAggregation) -> None:
+        namespace = key[0]
+        if agg.combine_sql() is not None:
+            await self._install(agg, code)
+            self._mvs[key] = agg.mv_names()
+        elif self._described[_code_hash(code)]["has_combine"]:
+            self._mvs.pop(key, None)
+            await self._combine(namespace, code, agg)
+        else:
+            raise ValueError("The script defines neither COMBINE_SQL nor combine()")
+        self.status[key] = None
+
+    async def _describe_code(self, code: str) -> dict:
         digest = _code_hash(code)
         if digest not in self._described:
             self._described[digest] = await self._executor.call(
                 "tradingkit.aggregation:describe_cross_source", {"code": code},
             )
-        described = self._described[digest]
+        return self._described[digest]
+
+    async def describe_run(
+        self, namespace: str, name: str, code: str, inputs: dict[str, str], params: dict | None = None,
+    ) -> DescribedAggregation:
+        """A run of a script with INPUTS: each role bound to a connection of the project,
+        its own values for the script's __params__, writing to a table named after the run."""
+        from tradingkit.core.script_ast import resolve_params, script_params
+        declared = script_params(code)
+        unknown = sorted(set(params or {}) - set(declared))
+        if unknown:
+            raise ValueError(f"The script declares no parameter {', '.join(unknown)}")
+        values = resolve_params(code, params)
+        described = await self._describe_code(code)
+        roles = described["inputs"]
+        if not roles:
+            raise ValueError("The script declares no INPUTS, so it runs by itself")
+        missing = [role for role in roles if not inputs.get(role)]
+        if missing:
+            raise ValueError(f"Choose a connection for {', '.join(missing)}")
+        bound = {role: await self.connection_input(namespace, inputs[role]) for role in roles}
+        for role, (table, _) in bound.items():
+            if not self._table_allowed(table):
+                raise ValueError(f"Input {role!r} reads table {table!r}, which aggregations may not read")
+        return DescribedAggregation(described, output_table_name(namespace, name), bound, values)
+
+    async def connection_input(self, namespace: str, connection: str) -> tuple[str, dict]:
+        """(table, filters) holding exactly the rows a connection of the project collects."""
+        from tradingkit.collector import connection_storage
+        from tradingkit.source import ScriptSource
+        conn = next((c for c in await self._db.list_connections()
+                     if c["name"] == connection and c["project"] == namespace), None)
+        if conn is None:
+            raise ValueError(f"No connection {connection!r} in this project")
+        code = await self._db.get_plugin_code(namespace, "source", conn["source"])
+        if not code:
+            raise ValueError(f"Connection {connection!r}: its source {conn['source']!r} is gone")
+        storage = connection_storage(conn, ScriptSource(code=code))
+        return storage.table, storage.filters
+
+    async def drop_output(self, namespace: str, name: str) -> None:
+        """Forget what a script or run computed, so it starts over: its views, its table
+        and its status."""
+        table = output_table_name(namespace, name)
+        async with self._lock:
+            await self._drop_mvs_into(table)
+            await self._db._execute(f"DROP TABLE IF EXISTS {table}")
+            self._installed.pop(table, None)
+            self._mvs.pop((namespace, name), None)
+            self.status.pop((namespace, name), None)
+
+    async def describe(self, namespace: str, code: str) -> DescribedAggregation:
+        """The script's declarations, read in a worker and cached per version of the code."""
+        described = await self._describe_code(code)
         agg = DescribedAggregation(described, output_table_name(namespace, described["output_table"]))
         for alias, ref in agg.required_sources().items():
             if not self._table_allowed(ref.table):
@@ -657,7 +817,7 @@ class AggregationWorker:
 
     async def _install(self, agg: DescribedAggregation, code: str) -> None:
         table = agg.OUTPUT_TABLE
-        digest = _code_hash(code)
+        digest = _code_hash(code + json.dumps(agg.bound_inputs, sort_keys=True))
         if self._installed.get(table) == digest:
             return
         aliases = set(agg.required_sources())
@@ -681,8 +841,9 @@ class AggregationWorker:
             return
         rows = await self._executor.call(
             "tradingkit.aggregation:run_cross_source_combine",
-            {"code": code, "start_ts": last_ts, "end_ts": now_ts, "source_filters": agg.SOURCE_FILTERS},
-            on_request=self.serve,
+            {"code": code, "start_ts": last_ts, "end_ts": now_ts, "source_filters": agg.SOURCE_FILTERS,
+             "params": agg.params},
+            on_request=functools.partial(self.serve, inputs=agg.bound_inputs),
         )
         if not rows:
             return
@@ -697,11 +858,23 @@ class AggregationWorker:
         await self._db.flush()
         logger.info(f"AggregationWorker: {namespace} → {table} stored {len(rows)} rows")
 
-    async def serve(self, ask: dict) -> bytes:
-        """Answer a script's ctx.query(): rows of a table `table_allowed` accepts, as
-        Arrow IPC. Pass it as `on_request` to run a script outside the worker."""
-        if ask.get("kind") != "rows":
-            raise ValueError(f"Unknown data request: {ask.get('kind')!r}")
+    async def serve(self, ask: dict, inputs: dict[str, tuple[str, dict]] | None = None) -> bytes:
+        """Answer a script's ctx.query() and ctx.input(): rows of a table `table_allowed`
+        accepts, as Arrow IPC. Pass it as `on_request` to run a script outside the worker,
+        with `inputs` the run's bound roles (DescribedAggregation.bound_inputs)."""
+        kind = ask.get("kind")
+        if kind == "input":
+            role = str(ask.get("role") or "")
+            if role not in (inputs or {}):
+                raise ValueError(f"No input {role!r}; this run binds {sorted(inputs or {})}")
+            table, filters = inputs[role]
+            warmup = max(0, min(int(ask.get("warmup") or 0), self._max_warmup))
+            df = await read_input(self._db, table, filters, ask.get("start_ts"), ask.get("end_ts"), warmup)
+            buffer = io.BytesIO()
+            df.write_ipc(buffer)
+            return buffer.getvalue()
+        if kind != "rows":
+            raise ValueError(f"Unknown data request: {kind!r}")
         table = str(ask.get("table") or "")
         if not self._table_allowed(table):
             raise ValueError(f"Aggregations may not read table {table!r}")
@@ -713,8 +886,8 @@ class AggregationWorker:
         df.write_ipc(buffer)
         return buffer.getvalue()
 
-    async def _load_scripts(self) -> list[tuple[str, str, str]]:
-        """(namespace, name, code) of every cross-source script the users saved.
+    async def _load_rows(self) -> list[tuple[str, str, str, str]]:
+        """(namespace, type, name, code) of every cross-source script and every run.
 
         Within-table aggregation(unit) scripts share type='aggregation' but are folded at
         query time instead, and the built-in templates are starting points, not jobs.
@@ -722,9 +895,11 @@ class AggregationWorker:
         if not self._db._conn:
             return []
         rows = await self._db._execute(
-            "SELECT namespace, name, code FROM plugin_library FINAL WHERE type = 'aggregation'"
+            "SELECT namespace, type, name, code FROM plugin_library FINAL"
+            " WHERE type IN ('aggregation', %(run)s)", {"run": INSTANCE_TYPE},
         )
-        return [(ns, name, code) for ns, name, code in rows if not AggregationScript(code).is_ch_mv()]
+        return [(ns, type_, name, code) for ns, type_, name, code in rows
+                if type_ == INSTANCE_TYPE or not AggregationScript(code).is_ch_mv()]
 
     async def _drop_mvs_into(self, table: str) -> None:
         for name in await self._agg_mvs():
