@@ -17,6 +17,7 @@ import os
 import socket
 import uuid
 
+import polars as pl
 import pytest
 
 from tradingkit.core.clickhouse import ClickHouseManager
@@ -308,7 +309,7 @@ async def combine(ctx, start_ts, end_ts):
     return [{"timestamp": start_ts, "value": 42.0}]
 """
     worker = AggregationWorker(db)
-    monkeypatch.setattr(worker, "_load_scripts", lambda: _async_value([(namespace, "fixed", code)]))
+    monkeypatch.setattr(worker, "_load_rows", lambda: _async_value([(namespace, "aggregation", "fixed", code)]))
     table = output_table_name(namespace, "fixed")
     try:
         await worker.run_once()
@@ -455,13 +456,13 @@ OUTPUT_TABLE = "spread"
 SOURCES = {{"btc": SourceRef("{btc}", field="close"), "eth": SourceRef("{eth}", field="close")}}
 COMBINE_SQL = "btc - eth"
 '''
-    scripts = [(namespace, "spread", code)]
+    scripts = [(namespace, "aggregation", "spread", code)]
 
     async def load():
         return list(scripts)
 
     worker = AggregationWorker(db, table_allowed=lambda t: t in (btc, eth))
-    monkeypatch.setattr(worker, "_load_scripts", load)
+    monkeypatch.setattr(worker, "_load_rows", load)
     output = output_table_name(namespace, "spread")
     mv_query = f"SELECT name FROM system.tables WHERE database = currentDatabase() AND position(name, '_to_{output}_') > 0"
     try:
@@ -483,3 +484,23 @@ COMBINE_SQL = "btc - eth"
             await db._execute(f"DROP VIEW IF EXISTS {name}")
         for table in (output, btc, eth):
             await db._execute(f"DROP TABLE IF EXISTS {table}")
+
+
+async def test_coverage_counts_distinct_rows_and_survives_a_reload(db):
+    table = f"test_cov_{uuid.uuid4().hex[:8]}"
+    await db.ensure_raw_table(table, {"timestamp": pl.Int64, "close": pl.Float64})
+    try:
+        df = pl.DataFrame({"timestamp": [0, 60, 3600, 3600, 7260], "close": [1.0, 2.0, 3.0, 3.0, 4.0]})
+        await db.insert_unit_batch(table, df, "ex", "S", "1m")
+        await db.flush()
+        assert await db.count_rows_by_bucket(table, {"symbol": "S"}, 7200, 3600) == {0: 2, 3600: 1}
+        await db.save_coverage(table, "k", 7200, {0: 2, 3600: 1})
+        await db.save_coverage(table, "k", 7300, {7200: 1})
+        assert await db.load_coverage(table, "k") == (7300, {0: 2, 3600: 1, 7200: 1})
+        await db.delete_rows_since(table, "ex", 3600)
+        assert await db.count_rows_by_bucket(table, {"symbol": "S"}, 10**10, 3600) == {0: 2}
+        await db.drop_coverage(table)
+        assert await db.load_coverage(table, "k") == (None, {})
+    finally:
+        await db.drop_coverage(table)
+        await db._execute(f"DROP TABLE IF EXISTS {table}")
