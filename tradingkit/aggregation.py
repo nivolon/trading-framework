@@ -294,8 +294,19 @@ class ScriptAggregation(Aggregation):
     def combine_sql(self) -> str | None:
         return self._ns.get("COMBINE_SQL")
 
+    def formula(self) -> Any:
+        """The script's FORMULA, parsed; None when it has none."""
+        text = self._ns.get("FORMULA")
+        if text is None:
+            return None
+        from tradingkit.formula import parse
+        return parse(str(text))
+
     def inputs(self) -> list[str]:
-        declared = self._ns.get("INPUTS") or []
+        declared = self._ns.get("INPUTS")
+        if not declared:
+            formula = self.formula()
+            return list(formula.names) if formula else []
         return [str(role) for role in (declared.keys() if isinstance(declared, dict) else declared)]
 
     def output_schema(self) -> dict[str, str] | None:
@@ -304,11 +315,20 @@ class ScriptAggregation(Aggregation):
     async def combine(self, ctx: AggregationContext, start_ts: int, end_ts: int) -> list[dict] | None:
         fn = self._ns.get("combine")
         if not callable(fn):
-            return None
+            formula = self.formula()
+            return await _combine_formula(formula, ctx, start_ts, end_ts) if formula else None
         result = fn(ctx, start_ts, end_ts)
         if asyncio.iscoroutine(result):
             result = await result
         return result
+
+
+async def _combine_formula(formula: Any, ctx: Any, start_ts: int, end_ts: int) -> list[dict]:
+    """A FORMULA over its inputs, with the rows its windows need read from before start_ts."""
+    from tradingkit.formula import evaluate
+    series = {name: await ctx.input(name, start_ts, end_ts, warmup=formula.warmup) for name in formula.names}
+    result = evaluate(formula, series)
+    return result.filter(pl.col("timestamp") >= start_ts).to_dicts()
 
 
 def load_aggregation_plugin(type_: str, params_dict: dict) -> Aggregation:
@@ -499,7 +519,8 @@ def describe_cross_source(code: str) -> dict:
             }
             for alias, ref in agg.required_sources().items()
         },
-        "has_combine": callable(ns.get("combine")),
+        "has_combine": callable(ns.get("combine")) or ns.get("FORMULA") is not None,
+        "formula": None if ns.get("FORMULA") is None else str(ns["FORMULA"]),
     }
 
 

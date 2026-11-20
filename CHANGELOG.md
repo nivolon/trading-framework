@@ -32,6 +32,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   factor, fees, exit reasons), the trades, the open trade, a thinned equity curve and
   monthly returns. Actions are 1, -1 and 0, so what a strategy's signals mean stays the
   caller's choice. `TradeRules.from_dict()` reads form input.
+- **Synthetic markets as a formula.** An aggregation script may declare
+  `FORMULA = "zscore(se3 - dk1, 96)"` instead of combine(): its names are its roles, the
+  inputs are aligned on timestamp and the formula is computed with Polars, parsed and
+  never executed. Arithmetic, abs/sqrt/log/exp, min/max/avg across series and
+  mean/std/zscore/change/pct/lag over windows, whose widest sets the warmup.
+  `tradingkit.formula.parse()` and `evaluate()`; `describe_cross_source()` reports the
+  formula.
+- **A connection can keep only recent history.** `keep_days` in its config: the collector
+  deletes the market's older rows every `prune_interval_s` (an hour by default) and
+  starts history and gap recovery no earlier, so they are not fetched again.
+  `ClickHouseManager.delete_unit_rows_before()` deletes one market's rows.
+- The sandbox spawner sets a worker's process limit only when the worker runs under a
+  uid of its own. RLIMIT_NPROC counts every process and thread of the user, so under a
+  shared uid (the tests, or a spawner without `--uid-first`) it counted the host's processes
+  and left a worker unable to start a thread; on CI that hung a test. Workers also cap
+  tokio's thread pool (`TOKIO_WORKER_THREADS`) like the others.
 - The collector gives a source its connection's `start_date` in `self.config`, so a
   source can fetch the history the collector will ask for in parts.
 - `Stream` refuses a step that is not a positive whole number, an unknown `updates` and a
