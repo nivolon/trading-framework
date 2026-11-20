@@ -616,6 +616,11 @@ class AggregationWorker:
     code; MVs whose script is gone or changed are dropped. combine() scripts run every
     `poll_interval` seconds over the rows that arrived since their last output.
 
+    A run also records how many rows of each input it was computed from, per
+    `heal_bucket_s` of time. When an input later gains rows in that span, as when a
+    connection fills a gap in its history, the run's output from the first such bucket
+    is dropped and computed again.
+
         worker = AggregationWorker(db, executor=executor, table_allowed=allowed)
         await worker.start()
         ...
@@ -629,6 +634,7 @@ class AggregationWorker:
         table_allowed: Callable[[str], bool] | None = None,
         poll_interval: float = _POLL_INTERVAL,
         max_warmup: int = 100_000,
+        heal_bucket_s: int = 3600,
     ) -> None:
         if executor is None:
             from tradingkit.executor.local import LocalExecutor
@@ -638,6 +644,9 @@ class AggregationWorker:
         self._table_allowed = table_allowed or (lambda table: True)
         self._poll_interval = poll_interval
         self._max_warmup = max_warmup
+        self._heal_bucket_s = heal_bucket_s
+        #: (output table, input key) -> (bound, {bucket: rows}) as last recorded.
+        self._coverage: dict[tuple[str, str], tuple[int | None, dict[int, int]]] = {}
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._described: dict[str, dict] = {}      # code hash -> description
@@ -693,6 +702,8 @@ class AggregationWorker:
             for (table,) in rows:
                 await self._db._execute(f"DROP TABLE IF EXISTS {table}")
             self._installed = {t: d for t, d in self._installed.items() if not t.startswith(prefix)}
+            self._coverage = {k: v for k, v in self._coverage.items() if not k[0].startswith(prefix)}
+            await self._db.drop_coverage(prefix, prefix=True)
             for key in [k for k in self._mvs if k[0] == namespace]:
                 del self._mvs[key]
             for key in [k for k in self.status if k[0] == namespace]:
@@ -803,6 +814,8 @@ class AggregationWorker:
             await self._drop_mvs_into(table)
             await self._db._execute(f"DROP TABLE IF EXISTS {table}")
             self._installed.pop(table, None)
+            self._coverage = {k: v for k, v in self._coverage.items() if k[0] != table}
+            await self._db.drop_coverage(table)
             self._mvs.pop((namespace, name), None)
             self.status.pop((namespace, name), None)
 
@@ -836,12 +849,62 @@ class AggregationWorker:
     async def _combine(self, namespace: str, code: str, agg: DescribedAggregation) -> None:
         table = agg.OUTPUT_TABLE
         now_ts = int(time.time())
-        last_ts = await self._get_last_ts(table, namespace) or 0
-        if now_ts <= last_ts:
+        start_ts = last_ts = await self._get_last_ts(table, namespace) or 0
+        late = await self._late_input(table, agg.bound_inputs) if last_ts else None
+        if late is not None and late <= last_ts:
+            await self._db.delete_rows_since(table, namespace, late)
+            logger.info(f"AggregationWorker: {table} recomputes from {late}, its inputs gained rows there")
+            start_ts = late
+        if now_ts > start_ts:
+            await self._store_combined(namespace, code, agg, start_ts, now_ts)
+        if agg.bound_inputs:
+            await self._record_coverage(table, agg.bound_inputs, await self._get_last_ts(table, namespace))
+
+    async def _late_input(self, table: str, inputs: dict[str, tuple[str, dict]]) -> int | None:
+        """The first bucket in which an input now has rows the output was not computed from."""
+        late = None
+        for key, (source, filters) in self._input_keys(inputs).items():
+            bound, seen = await self._recorded(table, key)
+            if bound is None:
+                continue
+            now = await self._db.count_rows_by_bucket(source, filters, bound, self._heal_bucket_s)
+            changed = [b for b in set(now) | set(seen) if now.get(b, 0) != seen.get(b, 0)]
+            if changed:
+                late = min(changed + ([late] if late is not None else []))
+        return late
+
+    async def _record_coverage(self, table: str, inputs: dict[str, tuple[str, dict]], bound: int | None) -> None:
+        if bound is None:
             return
+        for key, (source, filters) in self._input_keys(inputs).items():
+            _, seen = await self._recorded(table, key)
+            now = await self._db.count_rows_by_bucket(source, filters, bound, self._heal_bucket_s)
+            last = bound // self._heal_bucket_s * self._heal_bucket_s
+            changed = {b: n for b, n in now.items() if seen.get(b) != n}
+            changed.update({b: 0 for b in seen if b not in now})
+            changed[last] = now.get(last, 0)
+            await self._db.save_coverage(table, key, bound, changed)
+            self._coverage[(table, key)] = (bound, now)
+
+    async def _recorded(self, table: str, key: str) -> tuple[int | None, dict[int, int]]:
+        if (table, key) not in self._coverage:
+            self._coverage[(table, key)] = await self._db.load_coverage(table, key)
+        return self._coverage[(table, key)]
+
+    @staticmethod
+    def _input_keys(inputs: dict[str, tuple[str, dict]]) -> dict[str, tuple[str, dict]]:
+        """Each bound input under a key naming what it reads, so binding a role to another
+        connection starts its record afresh."""
+        return {json.dumps([role, source, filters], sort_keys=True): (source, filters)
+                for role, (source, filters) in inputs.items()}
+
+    async def _store_combined(
+        self, namespace: str, code: str, agg: DescribedAggregation, start_ts: int, end_ts: int,
+    ) -> None:
+        table = agg.OUTPUT_TABLE
         rows = await self._executor.call(
             "tradingkit.aggregation:run_cross_source_combine",
-            {"code": code, "start_ts": last_ts, "end_ts": now_ts, "source_filters": agg.SOURCE_FILTERS,
+            {"code": code, "start_ts": start_ts, "end_ts": end_ts, "source_filters": agg.SOURCE_FILTERS,
              "params": agg.params},
             on_request=functools.partial(self.serve, inputs=agg.bound_inputs),
         )

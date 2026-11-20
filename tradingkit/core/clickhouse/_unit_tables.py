@@ -343,6 +343,74 @@ class _UnitTablesMixin:
             schema=schema,
         )
 
+    @_validates_identifiers("table_name")
+    async def count_rows_by_bucket(
+        self, table_name: str, filters: dict, end_ts: int, bucket_s: int,
+    ) -> dict[int, int]:
+        """{bucket start: distinct timestamps} of the rows up to end_ts. Distinct, because a
+        replacing table holds a forming bar several times until it merges."""
+        where = ["timestamp <= %(et)s"]
+        params: dict[str, Any] = {"et": int(end_ts), "b": int(bucket_s)}
+        for i, col in enumerate(sorted(filters or {})):
+            _validate_identifier(col, kind="filter column")
+            where.append(f"{col} = %(f{i})s")
+            params[f"f{i}"] = filters[col]
+        rows = await self._execute(
+            f"SELECT intDiv(timestamp, %(b)s) * %(b)s AS bucket, uniqExact(timestamp)"
+            f" FROM {table_name} WHERE {' AND '.join(where)} GROUP BY bucket",
+            params, strict=True,
+        )
+        return {int(bucket): int(n) for bucket, n in rows}
+
+    async def _ensure_coverage_table(self) -> None:
+        if getattr(self, "_coverage_ready", False):
+            return
+        await self._execute(
+            "CREATE TABLE IF NOT EXISTS aggregation_coverage (output String, input String,"
+            " bucket Int64, rows UInt64, bound Int64, updated DateTime64(3) DEFAULT now64(3))"
+            " ENGINE = ReplacingMergeTree(updated) ORDER BY (output, input, bucket)",
+            strict=True,
+        )
+        self._coverage_ready = True
+
+    async def load_coverage(self, output: str, input_key: str) -> tuple[int | None, dict[int, int]]:
+        """What an aggregation output was computed from: (the latest timestamp it covered,
+        {bucket: rows of the input up to it}), (None, {}) before it was recorded."""
+        await self._ensure_coverage_table()
+        rows = await self._execute(
+            "SELECT bucket, rows, bound FROM aggregation_coverage FINAL"
+            " WHERE output = %(o)s AND input = %(i)s",
+            {"o": output, "i": input_key}, strict=True,
+        )
+        if not rows:
+            return None, {}
+        return max(int(r[2]) for r in rows), {int(r[0]): int(r[1]) for r in rows}
+
+    async def save_coverage(self, output: str, input_key: str, bound: int, counts: dict[int, int]) -> None:
+        """Record the buckets whose counts changed; `counts` must include the bucket holding
+        `bound`, whose row carries it."""
+        await self._ensure_coverage_table()
+        await self._bulk_insert(
+            "aggregation_coverage", ["output", "input", "bucket", "rows", "bound"],
+            [(output, input_key, bucket, n, int(bound)) for bucket, n in sorted(counts.items())],
+        )
+
+    async def drop_coverage(self, output: str, *, prefix: bool = False) -> None:
+        """Forget the coverage of an output, or with `prefix` of every output starting so."""
+        await self._ensure_coverage_table()
+        match = "startsWith(output, %(o)s)" if prefix else "output = %(o)s"
+        await self._execute(
+            f"ALTER TABLE aggregation_coverage DELETE WHERE {match} SETTINGS mutations_sync = 1",
+            {"o": output}, strict=True,
+        )
+
+    @_validates_identifiers("table_name")
+    async def delete_rows_since(self, table_name: str, exchange: str, start_ts: int) -> None:
+        await self._execute(
+            f"ALTER TABLE {table_name} DELETE WHERE exchange = %(ex)s AND timestamp >= %(st)s"
+            " SETTINGS mutations_sync = 1", {"ex": exchange, "st": int(start_ts)}, strict=True,
+        )
+
     @_validates_identifiers("raw_table")
     async def query_agg(
         self,

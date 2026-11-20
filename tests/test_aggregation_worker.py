@@ -124,6 +124,12 @@ class FakeDb:
     async def flush(self):
         pass
 
+    async def delete_rows_since(self, table, exchange, start_ts):
+        pass
+
+    async def drop_coverage(self, output, *, prefix=False):
+        pass
+
 
 def test_describe_returns_the_declarations_as_plain_data():
     described = describe_cross_source(SQL_SCRIPT)
@@ -330,3 +336,121 @@ async def test_ctx_input_adds_warmup_rows_before_the_range():
     )
     assert [r["timestamp"] for r in rows] == [0, 60, 120]
     assert db.warmups == [("candles", 59, 5), ("candles", 59, 5)]
+
+
+ALIGNED = '''
+INPUTS = ["a", "b"]
+
+async def combine(ctx, start_ts, end_ts):
+    a = await ctx.input("a", start_ts, end_ts)
+    b = dict(zip((await ctx.input("b", start_ts, end_ts))["timestamp"], (await ctx.input("b", start_ts, end_ts))["close"]))
+    return [{"timestamp": t, "value": x / b[t]} for t, x in zip(a["timestamp"], a["close"]) if t in b]
+'''
+
+HOUR = 3600
+
+
+class HealDb(FakeDb):
+    """Inputs per symbol and an output table kept in memory, with the coverage record."""
+
+    def __init__(self, scripts, inputs):
+        super().__init__(scripts)
+        self.inputs = inputs
+        self.output: dict[str, list[dict]] = {}
+        self.coverage: dict[tuple[str, str], dict] = {}
+        self.deleted: list = []
+
+    async def _execute(self, sql, params=None, **kw):
+        if sql.startswith("SELECT max(timestamp) FROM "):
+            rows = self.output.get(sql.split()[3], [])
+            return [(max(r["timestamp"] for r in rows),)] if rows else [(None,)]
+        return await super()._execute(sql, params, **kw)
+
+    async def fetch_from_unit_table(self, table, symbol=None, start_ts=None, end_ts=None, filters=None,
+                                    limit=None, newest_first=False):
+        stamps = [t for t in self.inputs[filters["symbol"]]
+                  if (start_ts is None or t >= start_ts) and (end_ts is None or t <= end_ts)]
+        return pl.DataFrame({"timestamp": stamps, "close": [float(t // HOUR + 1) for t in stamps]},
+                            schema={"timestamp": pl.Int64, "close": pl.Float64})
+
+    async def insert_unit_batch(self, table, df, exchange, symbol, timeframe):
+        rows = {r["timestamp"]: r for r in self.output.get(table, [])}
+        rows.update({r["timestamp"]: r for r in df.to_dicts()})
+        self.output[table] = sorted(rows.values(), key=lambda r: r["timestamp"])
+
+    async def delete_rows_since(self, table, exchange, start_ts):
+        self.deleted.append((table, start_ts))
+        self.output[table] = [r for r in self.output.get(table, []) if r["timestamp"] < start_ts]
+
+    async def count_rows_by_bucket(self, table, filters, end_ts, bucket_s):
+        counts: dict[int, int] = {}
+        for t in self.inputs[filters["symbol"]]:
+            if t <= end_ts:
+                counts[t // bucket_s * bucket_s] = counts.get(t // bucket_s * bucket_s, 0) + 1
+        return counts
+
+    async def load_coverage(self, output, input_key):
+        record = self.coverage.get((output, input_key))
+        return (record["bound"], dict(record["rows"])) if record else (None, {})
+
+    async def save_coverage(self, output, input_key, bound, counts):
+        record = self.coverage.setdefault((output, input_key), {"bound": bound, "rows": {}})
+        record["bound"] = bound
+        record["rows"].update(counts)
+
+    async def drop_coverage(self, output, *, prefix=False):
+        self.coverage = {k: v for k, v in self.coverage.items()
+                         if not (k[0].startswith(output) if prefix else k[0] == output)}
+
+
+def _heal_db(eth_hours, btc_hours):
+    return HealDb(
+        [("alice", "pair.py", ALIGNED), run_row("alice", "eth_btc", "pair.py", {"a": "eth", "b": "btc"})],
+        {"ETH_USDT": [h * HOUR for h in eth_hours], "BTC_USDT": [h * HOUR for h in btc_hours]},
+    )
+
+
+def _output_hours(db):
+    return [r["timestamp"] // HOUR for r in db.output[output_table_name("alice", "eth_btc")]]
+
+
+async def test_a_gap_an_input_fills_later_is_computed_again():
+    db = _heal_db(range(6), [0, 1, 2, 4, 5])
+    worker = AggregationWorker(db, table_allowed=lambda t: t == "candles", heal_bucket_s=HOUR)
+    await worker.run_once()
+    assert _output_hours(db) == [0, 1, 2, 4, 5]
+    db.inputs["BTC_USDT"].insert(3, 3 * HOUR)
+    await worker.run_once()
+    assert db.deleted == [(output_table_name("alice", "eth_btc"), 3 * HOUR)]
+    assert _output_hours(db) == [0, 1, 2, 3, 4, 5]
+    assert worker.status[("alice", "eth_btc")] is None
+
+
+async def test_the_record_survives_a_restart():
+    db = _heal_db(range(6), [0, 1, 4, 5])
+    await AggregationWorker(db, table_allowed=lambda t: t == "candles", heal_bucket_s=HOUR).run_once()
+    db.inputs["BTC_USDT"][2:2] = [2 * HOUR, 3 * HOUR]
+    await AggregationWorker(db, table_allowed=lambda t: t == "candles", heal_bucket_s=HOUR).run_once()
+    assert db.deleted == [(output_table_name("alice", "eth_btc"), 2 * HOUR)]
+    assert _output_hours(db) == [0, 1, 2, 3, 4, 5]
+
+
+async def test_new_rows_past_the_output_only_move_it_forward():
+    db = _heal_db(range(4), range(4))
+    worker = AggregationWorker(db, table_allowed=lambda t: t == "candles", heal_bucket_s=HOUR)
+    await worker.run_once()
+    db.inputs["ETH_USDT"] += [4 * HOUR, 5 * HOUR]
+    db.inputs["BTC_USDT"] += [4 * HOUR, 5 * HOUR]
+    await worker.run_once()
+    await worker.run_once()
+    assert db.deleted == []
+    assert _output_hours(db) == [0, 1, 2, 3, 4, 5]
+
+
+async def test_dropping_an_output_forgets_its_record():
+    db = _heal_db(range(3), range(3))
+    worker = AggregationWorker(db, table_allowed=lambda t: t == "candles", heal_bucket_s=HOUR)
+    await worker.run_once()
+    assert db.coverage
+    await worker.drop_output("alice", "eth_btc")
+    assert db.coverage == {} and worker._coverage == {}
