@@ -37,6 +37,7 @@ def worker_env() -> dict[str, str]:
         "POLARS_MAX_THREADS": threads,
         "OPENBLAS_NUM_THREADS": threads,
         "OMP_NUM_THREADS": threads,
+        "TOKIO_WORKER_THREADS": threads,
     }
 
 

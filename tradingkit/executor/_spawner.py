@@ -121,8 +121,12 @@ class Spawner:
             "OPENBLAS_NUM_THREADS": threads,
             "OMP_NUM_THREADS": threads,
             "NUMBA_NUM_THREADS": threads,
-            "TRADINGKIT_WORKER_NPROC": str(self.opts.max_procs),
+            "TOKIO_WORKER_THREADS": threads,
             "TRADINGKIT_WORKER_FILE_MB": str(self.opts.max_file_mb),
+            # RLIMIT_NPROC counts every process and thread of the user, so it bounds a worker
+            # only under a uid of its own; under a shared one it counts the host's processes
+            # too and leaves the worker unable to start a thread.
+            **({"TRADINGKIT_WORKER_NPROC": str(self.opts.max_procs)} if uid is not None else {}),
         }
 
     def serve(self, conn: socket.socket) -> None:

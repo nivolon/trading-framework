@@ -405,6 +405,20 @@ class _UnitTablesMixin:
         )
 
     @_validates_identifiers("table_name")
+    async def delete_unit_rows_before(
+        self, table_name: str, exchange: str, symbol: str, before_ts: int | None = None,
+    ) -> None:
+        """Delete one market's rows, all of them or those before `before_ts`."""
+        where = "exchange = %(ex)s AND symbol = %(sym)s"
+        params: dict[str, Any] = {"ex": exchange, "sym": symbol}
+        if before_ts is not None:
+            where += " AND timestamp < %(before)s"
+            params["before"] = int(before_ts)
+        await self._execute(
+            f"ALTER TABLE {table_name} DELETE WHERE {where} SETTINGS mutations_sync = 1", params, strict=True,
+        )
+
+    @_validates_identifiers("table_name")
     async def delete_rows_since(self, table_name: str, exchange: str, start_ts: int) -> None:
         await self._execute(
             f"ALTER TABLE {table_name} DELETE WHERE exchange = %(ex)s AND timestamp >= %(st)s"

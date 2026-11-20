@@ -201,3 +201,15 @@ def test_script_errors_name_the_line():
         run_strategy_script("x = 1\ny = missing + 1\n", candles)
     with pytest.raises(ScriptError, match="Line 1"):
         run_strategy_script("def broken(:\n", candles)
+
+
+def test_the_process_limit_applies_only_under_a_worker_uid():
+    import argparse
+
+    from tradingkit.executor._spawner import Spawner
+    opts = argparse.Namespace(uid_first=None, uid_count=0, max_workers=1, threads=1, pythonpath="",
+                              max_procs=64, max_file_mb=10)
+    spawner = Spawner(opts)
+    assert "TRADINGKIT_WORKER_NPROC" not in spawner._env(None)
+    assert spawner._env(20001)["TRADINGKIT_WORKER_NPROC"] == "64"
+    assert spawner._env(None)["TOKIO_WORKER_THREADS"] == "1"

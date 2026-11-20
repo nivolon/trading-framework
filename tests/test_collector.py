@@ -527,3 +527,35 @@ async def test_history_that_fails_outright_is_an_error_not_live():
     await worker._backfill()
     assert worker.progress["status"] == "error"
     assert "Invalid symbol" in worker.progress["error"]
+
+
+async def test_a_connection_keeps_only_the_days_it_is_told_to():
+    import time as _time
+
+    class PruneDb(FakeDb):
+        def __init__(self):
+            super().__init__()
+            self.deleted = []
+
+        async def delete_unit_rows_before(self, table, exchange, symbol, before_ts=None):
+            self.deleted.append((table, exchange, symbol, before_ts))
+
+    db = PruneDb()
+    worker = _make_worker(db=db, start_date="2020-01-01T00:00:00Z", config='{"keep_days": 2}')
+    two_days_ago = _time.time() - 2 * 86400
+    assert abs(worker._parse_start_ts() - two_days_ago) <= 60, "history starts at what it keeps"
+    await worker._prune()
+    await worker._prune()
+    assert len(db.deleted) == 1, "at most once per prune interval"
+    _, exchange, symbol, before = db.deleted[0]
+    assert (exchange, symbol) == ("whitebit", "BTC_USDT") and abs(before - two_days_ago) <= 60
+
+
+async def test_without_a_limit_everything_is_kept():
+    class PruneDb(FakeDb):
+        async def delete_unit_rows_before(self, *args, **kwargs):
+            raise AssertionError("nothing is deleted")
+
+    worker = _make_worker(db=PruneDb(), start_date="2020-01-01T00:00:00Z")
+    await worker._prune()
+    assert worker._parse_start_ts() == 1577836800

@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 _CONCURRENCY      = 5
 _GAP_INTERVAL     = 60
 _BAR_CLOSE_DELAY  = 2.0
+_PRUNE_INTERVAL = 3600  # seconds between deletions of rows a connection no longer keeps
 _HEALTH_INTERVAL  = 30
 _RECONNECT_CD     = 120
 _INFLIGHT_TTL     = 180
@@ -169,6 +170,11 @@ class _ConnectionWorker:
             )
         self._start_date    = conn.get("start_date") or None
         self._batch_size    = int(hist_cfg.get("batch_size",    1440))
+        # How much history the connection keeps: rows older than this many days are deleted
+        # and never fetched again. 0 keeps everything.
+        self._keep_days     = float(hist_cfg.get("keep_days") or 0)
+        self._prune_interval = float(hist_cfg.get("prune_interval_s", _PRUNE_INTERVAL))
+        self._last_prune: float = 0.0
 
         # Per-connection timing overrides from config JSON. Rate limiting and gap
         # batching are NOT here -- they live on the source (DataSource.rate_limit /
@@ -426,7 +432,17 @@ class _ConnectionWorker:
                 self._log.error(f"Gap recovery error: {e}")
                 self._gap_failures += 1
 
+    async def _prune(self) -> None:
+        """Delete the rows this connection no longer keeps, at most once per prune interval."""
+        if not self._keep_days or time.monotonic() - self._last_prune < self._prune_interval:
+            return
+        self._last_prune = time.monotonic()
+        cutoff = self._keep_from()
+        await self._db.delete_unit_rows_before(self._table, self._exchange, self._symbol, cutoff)
+        self._log.info(f"Kept {self._keep_days:g} days: rows before {cutoff} deleted")
+
     async def _gap_cycle(self) -> None:
+        await self._prune()
         """One gap-recovery attempt: overlay status, run it, then either clear the overlay
         (progress made) or escalate it to "stalled" once failures cross the threshold --
         never silently restore an overlay status (gap_recovery/stalled) as if it were the
@@ -581,10 +597,18 @@ class _ConnectionWorker:
         return UNIT_SCALE.get(self._source.timestamp_unit, 1)
 
     def _parse_start_ts(self) -> int:
+        """Where this connection's history starts: its start date, or the oldest row it
+        keeps when that is later."""
         raw = int(datetime.fromisoformat(self._start_date).timestamp() * self._scale())
         iv = self._unit_interval
         period_start = (raw // iv) * iv
-        return period_start + iv if period_start < raw else period_start
+        start = period_start + iv if period_start < raw else period_start
+        return max(start, self._keep_from()) if self._keep_days else start
+
+    def _keep_from(self) -> int:
+        iv = self._unit_interval
+        oldest = int((time.time() - self._keep_days * 86400) * self._scale())
+        return (oldest // iv) * iv
 
     def _safe_end(self) -> int:
         now = int(time.time() * self._scale())
