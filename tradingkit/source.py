@@ -65,6 +65,16 @@ class Stream:
     updates: Literal["replace", "append"] = "replace"
     history: bool = True
 
+    def __post_init__(self) -> None:
+        # Streams are read from a script without running it, so a step written as a name
+        # (step=QUARTER) arrives as the string "QUARTER".
+        if self.step is not None and (isinstance(self.step, bool) or not isinstance(self.step, int) or self.step <= 0):
+            raise ValueError(f"Stream step must be a positive whole number written in place, not {self.step!r}")
+        if self.updates not in ("replace", "append"):
+            raise ValueError(f"Stream updates must be 'replace' or 'append', not {self.updates!r}")
+        if self.table is not None and not isinstance(self.table, str):
+            raise ValueError(f"Stream table must be a name in quotes, not {self.table!r}")
+
     def check(self, columns: Any) -> None:
         if not self.columns:
             return

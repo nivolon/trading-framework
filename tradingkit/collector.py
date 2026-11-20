@@ -728,6 +728,10 @@ class DataCollector:
 
             config = json.loads(conn.get("config", "{}")) if isinstance(conn.get("config"), str) \
                      else conn.get("config", {})
+            # The connection's start date is the source's to read too, so it can fetch the
+            # history the collector will ask for in parts at once.
+            if conn.get("start_date"):
+                config = {**config, "start_date": conn["start_date"]}
             source = ScriptSource(code=code, config=config)
 
             agg_script = None

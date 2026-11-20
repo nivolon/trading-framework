@@ -540,3 +540,20 @@ async def test_rate_limit_throttles_by_min_delay():
     started = _time.monotonic()
     await src.rate_limit()
     assert _time.monotonic() - started >= 0.03
+
+
+@pytest.mark.parametrize("fields, message", [
+    ({"step": "QUARTER"}, "positive whole number"),
+    ({"step": 0}, "positive whole number"),
+    ({"step": True}, "positive whole number"),
+    ({"updates": "merge"}, "'replace' or 'append'"),
+])
+def test_a_stream_refuses_what_it_cannot_mean(fields, message):
+    with pytest.raises(ValueError, match=message):
+        Stream(**fields)
+
+
+def test_a_script_stream_with_a_named_step_says_so():
+    code = "Q = 900\nclass S(DataSource):\n    streams = {'p': Stream(table='candles', step=Q)}\n"
+    with pytest.raises(ValueError, match="not 'Q'"):
+        ScriptSource(code=code).stream_specs()

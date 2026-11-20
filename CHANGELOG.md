@@ -23,6 +23,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `tradingkit.collector.connection_storage()` and `ConnectionStorage`: the table a
   connection writes and the filters that select its rows, read from the source's
   declarations without running it. The collector uses it too.
+- **`tradingkit.backtest.simulate_trades()` and `TradeRules`.** Trades (timestamp,
+  action) orders over bars as an account would: fills at the next bar's open or the
+  signal bar's close, slippage and fees, position sizing by percent of equity, a fixed
+  amount or the risk to a stop, and stop-loss, take-profit, trailing-stop and time exits,
+  a stop counting before a target within one bar and a gap filling at the open. Returns
+  the stats (net and annual return, buy and hold, drawdown, Sharpe, win rate, profit
+  factor, fees, exit reasons), the trades, the open trade, a thinned equity curve and
+  monthly returns. Actions are 1, -1 and 0, so what a strategy's signals mean stays the
+  caller's choice. `TradeRules.from_dict()` reads form input.
+- The collector gives a source its connection's `start_date` in `self.config`, so a
+  source can fetch the history the collector will ask for in parts.
+- `Stream` refuses a step that is not a positive whole number, an unknown `updates` and a
+  table that is not a string. Streams are read from a script without running it, so
+  `step=QUARTER` used to arrive as the string "QUARTER" and fail later in the collector.
+- **Runs mend themselves when an input fills a gap.** `AggregationWorker` records, per
+  `heal_bucket_s` (an hour by default), how many rows of each input a run was computed
+  from, in the table `aggregation_coverage`. When an input later gains rows inside that
+  span, as when a connection backfills a gap, the run's output from the first such bucket
+  is deleted and computed again. The record survives restarts; `drop_output()` and
+  `drop_project()` clear it. New on `ClickHouseManager`: `count_rows_by_bucket()`,
+  `load_coverage()`, `save_coverage()`, `drop_coverage()` and `delete_rows_since()`.
 
 ## [0.6.0] - 2026-11-18
 
