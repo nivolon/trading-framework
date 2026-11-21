@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,11 +7,12 @@ build-backend = "setuptools.build_meta"
 # the importable package is still `tradingkit` (see [tool.setuptools.packages.find]
 # below), so `import tradingkit` in every example stays unchanged.
 name = "tradingkit-py"
-version = "0.5.0"
+version = "0.6.0"
 description = "Async trading framework with Polars, ClickHouse, and pluggable executors"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "BUSL-1.1" }
+license = "BUSL-1.1"
+license-files = ["LICENSE"]
 authors = [
     { name = "Maksym Holovin", email = "holovin.maksym@gmail.com" },
 ]
@@ -43,7 +44,7 @@ Issues = "https://github.com/nivolon/trading-framework/issues"
 # added opt-in rules) -- an unbounded ruff>=0.4 means CI silently starts enforcing new
 # categories on old code the day a newer ruff resolves, with no code change to explain the
 # failure. Capped to the range verified clean; bump deliberately, not implicitly.
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "mypy>=1.9", "ruff>=0.4,<0.17"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "pytest-timeout>=2.3", "mypy>=1.9", "ruff>=0.4,<0.17"]
 cpp = ["docker>=7.0.0"]
 
 [project.scripts]
@@ -99,3 +100,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# A test that waits on a worker forever fails here with every thread's stack, instead of
+# holding CI until the job limit with nothing in the log.
+timeout = 120

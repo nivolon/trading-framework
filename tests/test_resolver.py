@@ -26,6 +26,9 @@ class FakeDb:
         self.indicator_rows: dict = {}
         self.params_registry: dict = {}
         self.all_rows: list = []
+        self.base: str | None = "1m"
+        self.closed_bars = 0
+        self.aggregations: list = []
 
     async def get_indicator_coverage(self, params, exchange, symbol):
         return self.indicator_coverage
@@ -33,10 +36,20 @@ class FakeDb:
     async def count_rows(self, exchange, symbol, timeframe, **kw):
         return self.row_count
 
+    async def base_timeframe(self, table_name, exchange, symbol):
+        return self.base
+
+    async def count_closed_bars(self, exchange, symbol, tf_seconds, before_ts, base_timeframe):
+        return self.closed_bars
+
+    async def _execute(self, sql, params=None, **kw):
+        self.aggregations.append((sql, params))
+        return []
+
     async def get_data_range(self, exchange, symbol, timeframe, **kw):
         return self.data_range
 
-    async def fetch_data_df(self, exchange, symbol, tf_seconds, start_ts, end_ts):
+    async def fetch_data_df(self, exchange, symbol, tf_seconds, start_ts, end_ts, limit=None):
         return self.ohlcv_df
 
     async def store_indicator(self, params, exchange, symbol, values):
@@ -118,10 +131,51 @@ async def test_ensure_indicator_no_data_logs_and_returns():
     assert db.stored_indicators == []
 
 
-async def test_ensure_ohlcv_agg_skips_for_1m():
+async def test_ensure_ohlcv_agg_skips_the_base_timeframe():
     db = FakeDb()
+    db.base = "5m"
     resolver = DependencyResolver(db, executor=FakeExecutor([]))
-    await resolver._ensure_ohlcv_agg("1m", "wb", "BTC_USDT", None)  # must not raise / touch db
+    await resolver._ensure_ohlcv_agg("5m", "wb", "BTC_USDT", None)
+    assert db.aggregations == []
+
+
+async def test_ensure_ohlcv_agg_skips_a_market_with_no_rows():
+    db = FakeDb()
+    db.base = None
+    resolver = DependencyResolver(db, executor=FakeExecutor([]))
+    await resolver._ensure_ohlcv_agg("1h", "wb", "BTC_USDT", None)
+    assert db.aggregations == []
+
+
+@pytest.mark.parametrize("timeframe", ["90s", "7m", "1m"])
+async def test_ensure_ohlcv_agg_rejects_what_the_base_cannot_build(timeframe):
+    db = FakeDb()
+    db.base = "5m"
+    resolver = DependencyResolver(db, executor=FakeExecutor([]))
+    with pytest.raises(ValueError, match="multiple of 5m"):
+        await resolver._ensure_ohlcv_agg(timeframe, "wb", "BTC_USDT", None)
+
+
+async def test_ensure_ohlcv_agg_folds_missing_bars_from_the_base():
+    db = FakeDb()
+    db.base = "5m"
+    db.row_count = 3
+    db.closed_bars = 10
+    resolver = DependencyResolver(db, executor=FakeExecutor([]))
+    await resolver._ensure_ohlcv_agg("15m", "wb", "BTC_USDT", None)
+    (sql, params), = db.aggregations
+    assert params["src"] == "5m" and params["dst"] == "15m"
+    assert "intDiv(c.timestamp, 900) * 900" in sql
+    assert params["before"] % 900 == 0
+
+
+async def test_ensure_ohlcv_agg_is_a_no_op_when_every_closed_bar_is_stored():
+    db = FakeDb()
+    db.row_count = 10
+    db.closed_bars = 10
+    resolver = DependencyResolver(db, executor=FakeExecutor([]))
+    await resolver._ensure_ohlcv_agg("15m", "wb", "BTC_USDT", None)
+    assert db.aggregations == []
 
 
 async def test_progress_callback_invoked_during_indicator_resolution():

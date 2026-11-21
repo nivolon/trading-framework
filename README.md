@@ -106,7 +106,8 @@ ClickHouseManager + DependencyResolver (optional, application layer)
   | Executor | Isolation | Use case |
   |---|---|---|
   | `LocalExecutor` | none | development, trusted plugins |
-  | `SubprocessExecutor` | separate process, Arrow IPC, memory/timeout limits | untrusted-ish plugins, single machine |
+  | `SubprocessExecutor` | separate process, Arrow IPC, memory/timeout limits; shares the host's user, environment and network | your own plugins, single machine |
+  | `SandboxExecutor` | workers started by a spawner in another container, one Unix user per worker, no credentials, compute without network | code written by other people |
   | `RemoteExecutor` | separate host over HTTP | horizontal scaling, dedicated compute nodes — see [Security model](#security-model) before exposing it beyond localhost |
   | `CppRunnerPool` (attach to any of the above) | Docker, `--network=none`, seccomp, read-only rootfs | compiled `CppIndicator`/`CppStrategyPlugin` payloads |
 
@@ -183,10 +184,15 @@ being explicit about before you deploy it:
 **1. In-process script execution has no sandbox.** `ScriptIndicator`, `ScriptStrategy`,
 `ScriptSource`, and `AggregationScript` run their `code` string via `exec()` with full
 interpreter privileges — no import restrictions, no resource limits. Only run code you
-personally wrote or reviewed this way. If you need to run less-trusted plugin code, route
-it through `SubprocessExecutor` (process boundary + memory/timeout limits) or
-`CppRunnerPool` (Docker, `--network=none`, seccomp, read-only rootfs) instead of
-`LocalExecutor`.
+personally wrote or reviewed this way. `SubprocessExecutor` adds a process boundary and
+limits but keeps the host's user, environment and network, so the plugin can still read
+its credentials. For code written by other people use `SandboxExecutor`: run
+`python -m tradingkit.executor._spawner` in a container that holds no secrets, with
+`--uid-first` so each worker gets a Unix user of its own, and a second spawner with
+network access for sources and sinks. Worker replies are decoded as plain values only,
+so a plugin cannot make the host construct objects, and data reaches workers through
+the host (`executor.call(..., on_request=...)`) rather than through database
+credentials.
 
 **2. `tradingkit-runner` requires a token and rejects non-loopback binds without one.**
 `RemoteExecutor`/`tradingkit-runner` ship live plugin objects over the wire as pickle, so

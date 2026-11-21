@@ -4,6 +4,7 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
+from tests._fixtures.sources import frame_script
 from tradingkit.executor.local import LocalExecutor
 from tradingkit.executor.subprocess_ import SubprocessExecutor
 from tradingkit.indicator import CppIndicator, IndicatorContext, ScriptIndicator
@@ -46,7 +47,7 @@ async def test_local_executor_process_strategy_bar_no_signal():
 
 async def test_local_executor_fetch_source_data():
     executor = LocalExecutor()
-    source = ScriptSource(code="result = pl.DataFrame({'timestamp':[1],'close':[1.0]})")
+    source = ScriptSource(code=frame_script("{'timestamp': [1], 'close': [1.0]}"))
     df = await executor.fetch_source_data(source, "BTC_USDT", 60, 0, 100)
     assert df["close"].to_list() == [1.0]
 
@@ -90,7 +91,7 @@ async def test_subprocess_executor_process_strategy_bar():
 
 async def test_subprocess_executor_fetch_source_data():
     async with SubprocessExecutor(timeout_s=15) as executor:
-        source = ScriptSource(code="result = pl.DataFrame({'timestamp':[1],'close':[1.0]})")
+        source = ScriptSource(code=frame_script("{'timestamp': [1], 'close': [1.0]}"))
         df = await executor.fetch_source_data(source, "BTC_USDT", 60, 0, 100)
         assert df["close"].to_list() == [1.0]
 

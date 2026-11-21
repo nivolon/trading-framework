@@ -51,8 +51,13 @@ _CH_ARITH_RE  = re.compile(r"^[A-Za-z_][A-Za-z0-9_]* \* [A-Za-z_][A-Za-z0-9_]*$"
 # statement-injection shapes (extra statements, comments, DDL/DML keywords),
 # not every conceivable malicious expression.
 _CH_ARG_DANGER_RE = re.compile(
-    r";|--|/\*|\*/|\b(DROP|ALTER|INSERT|DELETE|ATTACH|DETACH|GRANT|REVOKE|"
-    r"UNION|EXEC|CREATE|TRUNCATE|RENAME|KILL|SYSTEM)\b",
+    r";|--|/\*|\*/|#|\b(DROP|ALTER|INSERT|DELETE|ATTACH|DETACH|GRANT|REVOKE|"
+    r"UNION|EXEC|CREATE|TRUNCATE|RENAME|KILL|SYSTEM|"
+    # A condition must not read other data: no subqueries, joins, dictionaries or
+    # table functions, which would reach tables the fold was not given.
+    r"SELECT|FROM|JOIN|WITH|IN|dictGet\w*|dictHas|joinGet\w*|file|url|remote\w*|s3\w*|"
+    r"hdfs|mysql|postgresql|mongodb|redis|sqlite|jdbc|odbc|executable|input|cluster\w*|"
+    r"merge|numbers|generateRandom|currentUser|currentDatabase|getSetting|hostName)\b",
     re.IGNORECASE,
 )
 
@@ -194,6 +199,11 @@ class Fold:
         all_args = col_args if not self.args else f"{col_args}, {self._args_sql()}"
         return f"{self.fn}State({all_args}) AS {alias}"
 
+    def ch_expr(self, alias: str) -> str:
+        """Plain aggregate over raw rows, for folding at query time: argMin(open, timestamp) AS open."""
+        state = self.ch_state_expr(alias)
+        return state.replace(f"{self.fn}State", self.fn, 1)
+
     def ch_merge_expr(self, col: str) -> str:
         """
         Query SELECT fragment.
@@ -239,6 +249,31 @@ class AggSpec:
     """
     buckets: list[int]
     folds:   list[Fold | PyFold]
+
+    def to_plain(self) -> dict:
+        """Built-in values only, for crossing a worker boundary. Python folds cannot."""
+        if any(isinstance(f, PyFold) for f in self.folds):
+            raise ValueError("Python folds (.compute()) cannot be folded in ClickHouse; use Fold methods")
+        return {
+            "buckets": [int(b) for b in self.buckets],
+            "folds": [
+                {"fn": f.fn, "field": f.field, "ch_type": f.ch_type, "by": f.by,
+                 "by_ch_type": f.by_ch_type, "args": list(f.args), "alias": f._alias}
+                for f in self.folds
+            ],
+        }
+
+    @classmethod
+    def from_plain(cls, data: dict) -> AggSpec:
+        """Rebuild from to_plain() output; every fold is validated again on the way in."""
+        return cls(
+            buckets=[int(b) for b in data["buckets"]],
+            folds=[
+                Fold(f["fn"], f["field"], f["ch_type"], f.get("by"), f.get("by_ch_type"),
+                     list(f.get("args") or []), f.get("alias"))
+                for f in data["folds"]
+            ],
+        )
 
 
 class _ArithProxy:

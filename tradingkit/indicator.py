@@ -6,13 +6,14 @@ Usage:
 """
 from __future__ import annotations
 
-import ast as _ast
-import re as _re
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
 import numpy as np
 import polars as pl
+
+from tradingkit.core.script_ast import resolve_params
+from tradingkit.core.script_errors import run_script
 
 # ------------------------------------------------------------------ #
 # TA namespace                                                          #
@@ -237,6 +238,11 @@ class ScriptIndicator(Indicator):
         self._code = code
 
     def compute(self, ctx: IndicatorContext) -> np.ndarray:
+        from tradingkit.script_api import call_indicator, is_function_script
+        if is_function_script(self._code):
+            columns = {col: ctx.df[col].to_numpy() for col in ctx.df.columns}
+            result = call_indicator(self._code, columns, self.params, {"ctx": ctx})
+            return next(iter(result.values())) if isinstance(result, dict) else result
         namespace: dict[str, Any] = {
             **{col: ctx.df[col].to_numpy() for col in ctx.df.columns},
             "ctx": ctx,
@@ -244,7 +250,7 @@ class ScriptIndicator(Indicator):
             "np":  np,
             **self.params,
         }
-        exec(compile(self._code, "<ui_indicator>", "exec"), namespace)  # noqa: S102
+        run_script(self._code, "<ui_indicator>", namespace)
         if "result" not in namespace:
             raise ValueError("Indicator code must assign to 'result'")
         return np.asarray(namespace["result"], dtype=np.float64)
@@ -302,18 +308,29 @@ ta_indicator = _TAIndicatorNS()
 # ------------------------------------------------------------------ #
 
 def _extract_defaults(code: str) -> dict[str, Any]:
-    """Parse ``__params__ = {...}`` literal from indicator code and return defaults."""
-    match = _re.search(r"__params__\s*=\s*(\{.*?\})", code, _re.DOTALL)
-    if not match:
-        return {}
-    try:
-        raw = _ast.literal_eval(match.group(1))
-        return {
-            k: (v["default"] if isinstance(v, dict) and "default" in v else v)
-            for k, v in raw.items()
-        }
-    except Exception:
-        return {}
+    """`__params__` defaults of indicator code."""
+    return resolve_params(code)
+
+
+class _TalibIndicator(Indicator):
+    """Delegates to TA-Lib via ctx.ta. Module-level so executors can pickle it."""
+
+    def __init__(self, type_name: str, period: int, source: str, extra: dict) -> None:
+        super().__init__(period=period, source=source)
+        self._type_name = type_name
+        self._talib_period = period
+        self._talib_source = source
+        self._extra = extra
+
+    def compute(self, ctx: IndicatorContext) -> np.ndarray:
+        src = getattr(ctx.np, self._talib_source, ctx.np.close)
+        result = getattr(ctx.ta, self._type_name)(src, length=self._talib_period, **self._extra)
+        if isinstance(result, tuple):
+            return np.asarray(result[0], dtype=np.float64)
+        return np.asarray(result, dtype=np.float64)
+
+    def required_periods(self) -> int:
+        return self._talib_period
 
 
 def _make_talib_indicator(
@@ -323,24 +340,7 @@ def _make_talib_indicator(
     extra: dict,
 ) -> Indicator:
     """Create an Indicator that delegates to TA-Lib (via ctx.ta namespace)."""
-
-    class _TalibIndicator(Indicator):
-        _tn = type_name
-        _p  = period
-        _s  = source
-        _ex = extra
-
-        def compute(self, ctx: IndicatorContext) -> np.ndarray:
-            src = getattr(ctx.np, self._s, ctx.np.close)
-            result = getattr(ctx.ta, self._tn)(src, length=self._p, **self._ex)
-            if isinstance(result, tuple):
-                return np.asarray(result[0], dtype=np.float64)
-            return np.asarray(result, dtype=np.float64)
-
-        def required_periods(self) -> int:
-            return self._p
-
-    return _TalibIndicator(period=period, source=source)
+    return _TalibIndicator(type_name, period, source, extra)
 
 
 def load_indicator_plugin(type_: str, params_dict: dict) -> Indicator:
@@ -359,15 +359,14 @@ def load_indicator_plugin(type_: str, params_dict: dict) -> Indicator:
         and not k.startswith("_")
     }
 
-    if type_ == "__script__":
+    if type_ in ("__script__", "__jit__"):
         code = params_dict.get("_code", "")
         defaults = _extract_defaults(code)
-        return ScriptIndicator(code=code, **{**defaults, **user_params})
-
-    if type_ == "__jit__":
-        code = params_dict.get("_code", "")
-        defaults = _extract_defaults(code)
-        return JitIndicator(code=code, **{**defaults, **user_params})
+        # `source` names the column a built-in reads; a script that declares it reads it too.
+        if "source" in defaults and "source" in params_dict:
+            user_params["source"] = params_dict["source"]
+        cls = ScriptIndicator if type_ == "__script__" else JitIndicator
+        return cls(code=code, **{**defaults, **user_params})
 
     if type_ == "__cpp__":
         import base64
@@ -503,6 +502,86 @@ class CppIndicator(Indicator):
         return self.__dict__.copy()
 
 
+_OHLCV_SCHEMA = {"timestamp": pl.Int64, "open": pl.Float64, "high": pl.Float64,
+                 "low": pl.Float64, "close": pl.Float64, "volume": pl.Float64}
+
+
+class _HostQuery:
+    """`ctx.query(symbol, timeframe)` for preview scripts: candles of another market or
+    timeframe, served by the host through the worker channel."""
+
+    def __init__(self, host: Any, exchange: str) -> None:
+        self._host = host
+        self._exchange = exchange
+        self._cache: dict = {}
+
+    def query(self, symbol: str, timeframe: str, exchange: str | None = None) -> pl.DataFrame:
+        import io
+        key = ((exchange or self._exchange or "").lower(), (symbol or "").upper(), timeframe)
+        if key not in self._cache:
+            raw = None
+            if self._host is not None:
+                raw = self._host.request("candles", exchange=key[0], symbol=key[1], timeframe=timeframe)
+            self._cache[key] = pl.read_ipc(io.BytesIO(raw)) if raw else pl.DataFrame(schema=_OHLCV_SCHEMA)
+        return self._cache[key]
+
+
+def _preview_result(result: Any, timestamps: np.ndarray) -> dict:
+    if isinstance(result, pl.Series):
+        result = result.to_numpy()
+    if isinstance(result, (list, tuple)):
+        result = np.asarray(result, dtype=np.float64)
+    if isinstance(result, np.ndarray):
+        values = result.astype(np.float64, copy=False)
+        return {"type": "line", "data": [
+            [int(ts), float(v)] for ts, v in zip(timestamps, values) if not np.isnan(v)
+        ]}
+    if isinstance(result, pl.DataFrame):
+        columns = result.columns
+        if {"open", "high", "low", "close"}.issubset(columns):
+            return {"type": "ohlcv",
+                    "data": result.select(["timestamp", "open", "high", "low", "close"]).to_dicts()}
+        return {"type": "multi", "columns": [c for c in columns if c != "timestamp"],
+                "rows": result.to_dicts()}
+    return {"type": "line", "data": []}
+
+
+def preview_indicator_script(
+    code: str,
+    params: dict,
+    data: bytes,
+    symbol: str = "",
+    timeframe: str = "",
+    exchange: str = "",
+    host: Any = None,
+) -> dict:
+    """Run an editor indicator script over candles (Arrow IPC bytes) and return what a
+    chart draws. Meant to run in a worker, via executor.call(); `ctx.query()` asks the host."""
+    import io
+
+    from tradingkit.script_api import call_indicator, is_function_script
+    df = pl.read_ipc(io.BytesIO(data)) if data else pl.DataFrame(schema=_OHLCV_SCHEMA)
+    column = lambda name, dtype: df[name].to_numpy() if len(df) else np.array([], dtype=dtype)
+    if is_function_script(code):
+        columns = {name: column(name, np.int64 if name == "timestamp" else np.float64)
+                   for name in ("timestamp", "open", "high", "low", "close", "volume")}
+        result = call_indicator(code, columns, params, {"ctx": _HostQuery(host, exchange), "pl": pl, "df": df})
+        if isinstance(result, dict):
+            result = pl.DataFrame({"timestamp": columns["timestamp"], **result}).fill_nan(None)
+        return _preview_result(result, columns["timestamp"])
+    namespace: dict[str, Any] = {
+        "close": column("close", np.float64), "high": column("high", np.float64),
+        "low": column("low", np.float64), "open": column("open", np.float64),
+        "volume": column("volume", np.float64), "ts": column("timestamp", np.int64), "df": df,
+        "symbol": symbol, "timeframe": timeframe, "exchange": exchange,
+        "ta": _ta_ns, "np": np, "pl": pl, "ctx": _HostQuery(host, exchange),
+        "result": None,
+        **params,
+    }
+    run_script(code, "<indicator>", namespace)
+    return _preview_result(namespace.get("result"), namespace["ts"])
+
+
 __all__ = [
     "IndicatorContext",
     "Indicator",
@@ -517,4 +596,5 @@ __all__ = [
     "_extract_defaults",
     "_make_talib_indicator",
     "load_indicator_plugin",
+    "preview_indicator_script",
 ]

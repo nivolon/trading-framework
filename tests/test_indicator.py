@@ -133,3 +133,12 @@ def test_ta_namespace_rsi(df):
     rsi = ctx.ta.rsi(ctx.np.close, 14)
     assert isinstance(rsi, np.ndarray)
     assert len(rsi) == 30
+
+
+def test_talib_indicator_survives_pickling_for_subprocess_executors():
+    import pickle
+
+    from tradingkit.indicator import load_indicator_plugin
+
+    indicator = pickle.loads(pickle.dumps(load_indicator_plugin("rsi", {"period": 14})))
+    assert indicator.required_periods() == 14

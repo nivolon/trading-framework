@@ -5,6 +5,228 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.6.0] - 2026-11-21
+
+Plugins written by other people can run safely: a sandbox executor, plain-value worker
+replies and guarded data access. Sources become classes with named streams, and a new
+output plugin, `Sink`, delivers results.
+
+### Changed
+- **Breaking: sources are classes only, with a new contract.** A source implements
+  `history()` for one request and `live()` for one connection; `setup()` and `close()` are
+  optional and run once. The framework now owns the HTTP session (`self.session`), retries
+  (`max_retries`, `retry_delay_s`), rate limits, the reconnect loop (`reconnect_delay_s`,
+  `max_reconnect_delay_s`) and treating a silent connection as dead (`stale_timeout_s`).
+  The `historical()`/`realtime()` function style and the `result =` expression style are
+  gone, as is overriding `get_historical_data()` and `stream()`.
+- **`AggregationWorker` runs only what is in `plugin_library`.** It used to fall back to
+  the host app's `BUILTIN_AGGREGATIONS`, so a fresh install ran templates nobody had added
+  and polled tables that did not exist. Builtins remain available as templates.
+- **Breaking: `AggregationWorker(db, executor=None, table_allowed=None, poll_interval=60)`
+  runs cross-source scripts in the executor's workers.** The host no longer executes them:
+  it reads their declarations (`describe_cross_source()`) and rows
+  (`run_cross_source_combine()`) as plain data and answers `ctx.query()` itself, only for
+  tables `table_allowed` accepts. Each project writes to its own table,
+  `output_table_name(namespace, OUTPUT_TABLE)`, which always starts with `agg_`.
+  `COMBINE_SQL` scripts now get their Materialized Views installed (nothing did before),
+  once per version of the code, and MVs whose script is gone or changed are dropped.
+  `run_once()` does one pass; `status` holds each script's last error. `_run_one()` and
+  `_load_python_scripts()` are gone.
+- **Built-in OHLCV bars fold from the market's base timeframe**, the finest one stored,
+  instead of assuming `1m`: a source with a `5m` or `1s` stream gets every multiple of it.
+  `_ensure_ohlcv_agg()` raises `ValueError` for a timeframe the base cannot build, and
+  `fetch_data_df()` reads the base. **Breaking:** `count_closed_bars()` and
+  `invalidate_derived()` take the base timeframe; `invalidate_derived()` used to treat
+  every timeframe but `1m` as derived, and would have deleted a `5m` source's own rows.
+- **Weekly bars start on Mondays everywhere.** Built-in bars started on Mondays while
+  aggregation folds, Materialized Views and closed-bar counts started on Thursdays (the
+  epoch's weekday), so the same week differed between them. `get_period_start()` follows
+  the same rule.
+- **`PluginExecutor.open_source()`** returns a `SourceSession`. Under `SubprocessExecutor`
+  it is a long-lived worker process per connection: the plugin is set up once, streaming
+  is isolated for the first time, and a dead worker is restarted.
+- **Sources describe their data as named `Stream`s** (`table`, `columns`, `step`, `updates`,
+  `history`) instead of `TABLE_NAME`. Behaviour follows from these properties: `step` enables
+  gap recovery, `updates` picks replacing or appending storage. A connection selects one
+  stream with `config["stream"]`, defaulting to the first declared.
+- `ScriptSource` no longer executes a script to answer questions about it: table name,
+  timestamp unit and capabilities are read from the source text.
+- `DataCollector` no longer requires a symbol or a start date. A connection without a start
+  date collects live data only, with no backfill or gap recovery.
+- `DataCollector` reports `reconnecting` with the reason, and runs gap recovery as soon as
+  a stream reconnects rather than at the next interval.
+- **Live runs see what a backtest sees.** `Pipeline.run_live()` used to call strategies on
+  every update of the forming bar and started with no history. Bars now close by the clock
+  (end plus `bar_close_delay_s`) from the exchange's own record, with `provisional=True` on
+  signals when that record can't be had, and indicators are warmed up first.
+- `DataCollector` closes bars the same way, storing the official bar and calling
+  `on_bar_closed`.
+- **The license is declared as the SPDX expression `BUSL-1.1`**, which setuptools 77+
+  requires; the old table form stops building in 2027.
+
+### Added
+- **Indicators and strategies as one function** (`tradingkit.script_api`). The last
+  public top-level function of a script runs; an argument typed `Series` is one series of
+  the bars (close, open, high, low, volume, hl2, hlc3, ohlc4, chosen by a parameter of the
+  same name), one typed `Bars` gets every column, and every other argument with a default
+  is a parameter: `script_params()` reads them from the signature when there is no
+  `__params__`. An indicator returns an array or a dict of named arrays; a strategy
+  returns `Signals(buy=, sell=, exit=)`, with `cross_above()` and `cross_below()`.
+  `ScriptIndicator`, `preview_indicator_script()` and `run_strategy_script()` run such
+  scripts; scripts written the older way run as before. `describe()` gives the inputs,
+  parameters, output and imports for an editor.
+- **Scripts import each other.** `from project.indicators import name` gives the function
+  of another script of the project, `from builtin.indicators import rsi` a TA-Lib one
+  taking its usual arguments, and `chartword` the names every script has. The caller that
+  knows the project attaches what a script imports with `bundle(code, modules)`, after the
+  code so its line numbers stay; `run_script()` installs them while the script runs and
+  removes them after. `project_imports()` lists what a script imports, without running it.
+- **Aggregations across markets name roles, not markets.** A script declares
+  `INPUTS = ["a", "b"]` and reads a role with `ctx.input("a", start_ts, end_ts)`;
+  `COMBINE_SQL` names the roles as columns (each input's `close`, or the column
+  `INPUT_FIELDS` gives). A run binds each role to a connection of the project: stored in
+  `plugin_library` as `INSTANCE_TYPE` (`{"script", "inputs"}`) under the run's name.
+  `AggregationWorker` computes every run into a table of its own
+  (`output_table_name(project, run)`), checks the inputs against `table_allowed`, and
+  serves `ctx.input()` only for the roles a run binds. New on the worker:
+  `describe_run()`, `connection_input()` and `drop_output()`. A script with `INPUTS`
+  is a template and never runs by itself; scripts without it run as before.
+- `AggregationContext(db, inputs={role: (table, filters)})` gives `ctx.input()` outside
+  the worker.
+- `tradingkit.collector.connection_storage()` and `ConnectionStorage`: the table a
+  connection writes and the filters that select its rows, read from the source's
+  declarations without running it. The collector uses it too.
+- **`tradingkit.backtest.simulate_trades()` and `TradeRules`.** Trades (timestamp,
+  action) orders over bars as an account would: fills at the next bar's open or the
+  signal bar's close, slippage and fees, position sizing by percent of equity, a fixed
+  amount or the risk to a stop, and stop-loss, take-profit, trailing-stop and time exits,
+  a stop counting before a target within one bar and a gap filling at the open. Returns
+  the stats (net and annual return, buy and hold, drawdown, Sharpe, win rate, profit
+  factor, fees, exit reasons), the trades, the open trade, a thinned equity curve and
+  monthly returns. Actions are 1, -1 and 0, so what a strategy's signals mean stays the
+  caller's choice. `TradeRules.from_dict()` reads form input.
+- **Synthetic markets as a formula.** An aggregation script may declare
+  `FORMULA = "zscore(se3 - dk1, 96)"` instead of combine(): its names are its roles, the
+  inputs are aligned on timestamp and the formula is computed with Polars, parsed and
+  never executed. Arithmetic, abs/sqrt/log/exp, min/max/avg across series and
+  mean/std/zscore/change/pct/lag over windows, whose widest sets the warmup.
+  `tradingkit.formula.parse()` and `evaluate()`; `describe_cross_source()` reports the
+  formula.
+- **A connection can keep only recent history.** `keep_days` in its config: the collector
+  deletes the market's older rows every `prune_interval_s` (an hour by default) and
+  starts history and gap recovery no earlier, so they are not fetched again.
+  `ClickHouseManager.delete_unit_rows_before()` deletes one market's rows.
+- The sandbox spawner sets a worker's process limit only when the worker runs under a
+  uid of its own. RLIMIT_NPROC counts every process and thread of the user, so under a
+  shared uid (the tests, or a spawner without `--uid-first`) it counted the host's processes
+  and left a worker unable to start a thread; on CI that hung a test. Workers also cap
+  tokio's thread pool (`TOKIO_WORKER_THREADS`) like the others.
+- The collector gives a source its connection's `start_date` in `self.config`, so a
+  source can fetch the history the collector will ask for in parts.
+- `Stream` refuses a step that is not a positive whole number, an unknown `updates` and a
+  table that is not a string. Streams are read from a script without running it, so
+  `step=QUARTER` used to arrive as the string "QUARTER" and fail later in the collector.
+- **Runs mend themselves when an input fills a gap.** `AggregationWorker` records, per
+  `heal_bucket_s` (an hour by default), how many rows of each input a run was computed
+  from, in the table `aggregation_coverage`. When an input later gains rows inside that
+  span, as when a connection backfills a gap, the run's output from the first such bucket
+  is deleted and computed again. The record survives restarts; `drop_output()` and
+  `drop_project()` clear it. New on `ClickHouseManager`: `count_rows_by_bucket()`,
+  `load_coverage()`, `save_coverage()`, `drop_coverage()` and `delete_rows_since()`.
+- **`bucket_sql(column, seconds)`** is `get_period_start()` as a ClickHouse expression, so
+  SQL and Python agree on where a bar starts.
+- **C++ indicators run in a worker (`tradingkit.cpp`).** `preview_cpp_indicator()`
+  compiles a file exporting `extern "C" void indicator_compute(...)` with the system g++
+  and loads it from memory, so worker temp directories can stay `noexec`. Includes are
+  limited to `ALLOWED_INCLUDES`, compile errors raise `ScriptError` with the line, and
+  `cpp_params()` reads parameter defaults from calls like
+  `read_int(params_json, "period", 20)`.
+- **Script errors name their line.** Strategy and indicator scripts raise `ScriptError`
+  with the line that failed, for example `Line 2: NameError: ...`, and its `line`.
+- **`SandboxExecutor` and the sandbox spawner (`python -m tradingkit.executor._spawner`).**
+  Every plugin runs in a worker started inside another container, each worker as its
+  own Unix user with memory, CPU-time, process and file-size limits, and every process
+  it leaves behind killed and its files deleted before the user is reused. Compute work
+  and sources/sinks go to separate spawners, so only the latter need a network.
+- **`executor.call("module:function", kwargs, on_request=...)`** runs a trusted function
+  in a worker; the function asks the host for data through its `host` argument instead
+  of holding database credentials. `preview_indicator_script()` and
+  `describe_aggregation_spec()` are built for it.
+- **`AggregationScript.fold()` builds bars of any timeframe at query time.** It reads the
+  script's `aggregation(unit)` folds against its `SOURCE_TABLE` and folds the market's
+  deduplicated base rows in ClickHouse (`fold_buckets()`, `Fold.ch_expr()`), so a custom
+  aggregation works for custom timeframes without per-bucket tables. `base_timeframe()`
+  finds the finest stored timeframe to fold from.
+- **`_execute(strict=True)` raises `ClickHouseQueryError`** with the server's message
+  instead of logging it and returning `[]`.
+- **`Sink` / `ScriptSink`**, the output plugin. `send()` makes one delivery; a long-lived
+  connection opens in `setup()`. The framework retries and restores the connection, and
+  `PluginExecutor.open_sink()` runs it in its own worker under `SubprocessExecutor`.
+- A `secret` parameter type, for values a UI must not show back.
+- `Strategy.on_tick()`, optional, for every update of the forming bar in a live run.
+  Signals from it carry `tick=True`. It cannot be backtested.
+- `run_strategy_script()` and `PluginExecutor.run_strategy_script()`: one way to run a
+  vectorized strategy over closed bars, used for both history and live. Sandboxed under
+  `SubprocessExecutor`.
+- `param_problems()`: reports unknown keys, types and scopes in `__params__`.
+- `TransientSourceError`, for failures a plugin wants retried.
+- **`script_params()` / `resolve_params()`** in `tradingkit.core.script_ast`: one exec-free
+  reader for `__params__`, with values cast to the declared type and checked against
+  `options`, `min` and `max`. A host app can build a form from a script and keep the values
+  outside its code.
+
+### Security
+- **Worker output is no longer unpickled.** A plugin runs in the same process that writes
+  the worker's reply, so it could forge a pickle that executed code in the host. Replies
+  now carry built-in values only and are decoded by `_wire.plain_loads()`, which never
+  imports or constructs a class.
+- **Fold arguments cannot read other data:** subqueries, joins, dictionaries and table
+  functions are rejected, and folding queries run with `readonly=2`.
+- **Sources cannot write to the host's tables.** A stream names its own table, so a
+  source could insert rows into `plugin_library` or any other table. `DataCollector`
+  takes `table_allowed(name)` and refuses every other table.
+
+### Fixed
+- A connection that keeps only recent days deleted the older rows for the first time
+  only an hour after the machine booted: the first prune compared against a start of 0
+  on the monotonic clock. It now runs straight away.
+- A script indicator that declares a `source` parameter gets the value it was given;
+  `load_indicator_plugin()` dropped it, as it does for built-ins that read it themselves.
+- **`tradingkit.__version__` said `0.1.0`.** It now reads the installed package version.
+- **A failed insert reopens the native ClickHouse connection.** After ClickHouse
+  restarted, the connection was left holding an unread result and refused every insert
+  until the app was restarted.
+- **Query parameters accept lists and tuples**, rendered as escaped SQL tuples for `IN`.
+- **Minute bars were stored under the connection's timeframe.** A source always writes
+  one-minute units, but `_ConnectionWorker` labelled them with `conn["timeframe"]`, so a
+  `1h` connection filled the `1h` label with 60s-spaced rows that charts drew as hourly
+  candles. Rows are now always labelled `1m`, a different requested timeframe logs a
+  warning, and higher timeframes come from aggregation as designed.
+- **`fetch_data()` could return one timestamp several times.** The live stream re-inserts
+  the forming bar, and without `FINAL` every unmerged row reached the caller.
+- **Gap recovery never filled a gap inside stored data.** `_batch_complete()` treated any
+  range between the oldest and newest row as complete, so a detected gap was skipped
+  without fetching. It now counts the rows actually stored.
+- **Gap detection mixed timeframes.** Aggregated bars share the `candles` table and hid
+  parts of a gap; `get_unit_range()` and `find_unit_gaps()` now filter on the timeframe.
+- **Bars and indicators stayed stale after a recovered gap.** Filling a gap now drops the
+  derived data from that point, and aggregation counts the closed bars exactly instead of
+  estimating. Aggregation also reads `FINAL`, so a forming bar's volume is not summed twice.
+- **Custom timeframes were treated as one minute.** `DependencyResolver` looked timeframes
+  up in a fixed table with a 60s fallback, so `7m` computed warmup and bucketing as `1m`.
+  It now uses `parse_timeframe()`.
+- **Built-in indicators computed nothing.** `fetch_ohlcv_aggregated()` filtered on
+  `timeframe = '60'` while rows are labelled `1m`, so the resolver always found no data.
+- **Indicators covered the oldest bars only.** The resolver fetched with the default limit
+  of 10000 in ascending order, so a longer history was cut off before the visible range.
+- **TA-Lib indicators could not run under `SubprocessExecutor`.** The class was defined
+  inside a function, so it could not be pickled.
+- **`__params__` defaults were silently lost on indicators.** `_extract_defaults()` matched
+  with a regex that stopped at the first `}`, so the documented nested declaration parsed
+  to nothing. It now goes through `resolve_params()`.
+
 ## [0.5.0] - 2026-08-09
 
 Analytics come back as user-written plugins, and the regression 0.4.0 shipped is fixed.

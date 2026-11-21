@@ -31,6 +31,8 @@ Writing a strategy:
 
 # ── Indicator ────────────────────────────────────────────────────────
 # ── Aggregation ──────────────────────────────────────────────────────
+from importlib import metadata as _metadata
+
 from tradingkit.aggregation import (
     Aggregation,
     AggregationContext,
@@ -91,10 +93,15 @@ from tradingkit.pipeline import (
     PipelineResult,
 )
 
+# ── Sink ─────────────────────────────────────────────────────────────
+from tradingkit.sink import ScriptSink, Sink
+
 # ── Source ───────────────────────────────────────────────────────────
 from tradingkit.source import (
     DataSource,
     ScriptSource,
+    Stream,
+    TransientSourceError,
 )
 
 # ── Strategy ─────────────────────────────────────────────────────────
@@ -108,7 +115,10 @@ from tradingkit.strategy import (
     load_strategy_plugin,
 )
 
-__version__ = "0.1.0"
+try:
+    __version__ = _metadata.version("tradingkit-py")
+except _metadata.PackageNotFoundError:
+    __version__ = "0+unknown"
 
 __all__ = [
     # Indicator
@@ -130,7 +140,11 @@ __all__ = [
     "StrategyPlugin",
     # Source
     "DataSource",
+    "ScriptSink",
     "ScriptSource",
+    "Sink",
+    "Stream",
+    "TransientSourceError",
     # Executor
     "PluginExecutor",
     "LocalExecutor",

@@ -18,18 +18,25 @@ Usage:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
 import polars as pl
 
+from tradingkit.core.timeframe import UNIT_SCALE
 from tradingkit.indicator import Indicator, IndicatorContext
 from tradingkit.source import DataSource
 from tradingkit.strategy import BarContext, Signal, Strategy
 
 logger = logging.getLogger(__name__)
+
+#: History fetched before a live run, as a multiple of what indicators ask for: recursive
+#: ones such as EMA keep converging well past their declared period.
+WARMUP_MARGIN = 3
 
 
 async def _gap_rows(
@@ -262,8 +269,15 @@ class Pipeline:
         timeframe: int,
     ) -> AsyncIterator[Signal]:
         """
-        Stream live signals as new rows arrive from source.stream().
-        Yields Signal objects. Requires source to support streaming.
+        Stream live signals. The strategy sees the same thing as in run(): closed bars.
+
+        A bar closes by the clock, at its end plus the source's `bar_close_delay_s`, and
+        the exchange's own record of it is fetched, so a backtest over the same period
+        gets the same rows. If that fails the last stream update is used and the signal
+        carries `provisional=True`. Indicators are warmed up from history first.
+
+        A strategy that defines on_tick() also gets every update of the forming bar;
+        those signals carry `tick=True`.
 
         `timeframe` is an integer step in the source's own timestamp unit — see run().
 
@@ -319,21 +333,115 @@ class Pipeline:
             signal.gap_recovered = gap_recovered
             return signal
 
-        async for row in self.source.stream(symbol, timeframe):
-            if rows_acc:
-                filler = await _gap_rows(
-                    [rows_acc[-1], row], self.source, symbol, timeframe,
-                )
-                if filler:
-                    logger.info(f"Backfilled {len(filler)} missing bars for {symbol}")
-                for missing_row in filler:
-                    signal = await _step(missing_row, gap_recovered=True)
-                    if signal is not None:
-                        yield signal
+        rows_acc.extend(await self._warmup(executor, symbol, timeframe))
 
-            signal = await _step(row, gap_recovered=False)
-            if signal is not None:
-                yield signal
+        scale = UNIT_SCALE.get(self.source.timestamp_unit, 1)
+        delay = float(self.source.config.get("bar_close_delay_s", 2))
+        wants_ticks = self.strategy.has_on_tick()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def pump() -> None:
+            try:
+                async for update in self.source.stream(symbol, timeframe):
+                    queue.put_nowait(update)
+            finally:
+                queue.put_nowait(None)
+
+        def closes_at(bar_ts: int) -> float:
+            return (bar_ts + timeframe) / scale + delay
+
+        forming: dict[int, dict] = {}
+        stream_ended = False
+        last_closed = rows_acc[-1]["timestamp"] if rows_acc else None
+        pump_task = asyncio.create_task(pump())
+        try:
+            while forming or not stream_ended:
+                wait = max(min(map(closes_at, forming)) - time.time(), 0.001) if forming else None
+                if stream_ended:
+                    await asyncio.sleep(wait)
+                else:
+                    try:
+                        updates = [await asyncio.wait_for(queue.get(), wait)]
+                    except TimeoutError:
+                        updates = []
+                    # Everything already received goes first: a bar must not close while
+                    # its last update is still waiting in the queue.
+                    while not queue.empty():
+                        updates.append(queue.get_nowait())
+
+                    for update in updates:
+                        if update is None:
+                            stream_ended = True
+                        elif last_closed is None or update["timestamp"] > last_closed:
+                            forming[update["timestamp"]] = update
+                            if wants_ticks:
+                                signal = await self._tick(update)
+                                if signal is not None:
+                                    yield signal
+
+                for bar_ts in sorted(ts for ts in forming if closes_at(ts) <= time.time()):
+                    row, provisional = await self._closed_bar(
+                        executor, symbol, timeframe, forming.pop(bar_ts),
+                    )
+                    last_closed = bar_ts
+                    if rows_acc:
+                        filler = await _gap_rows(
+                            [rows_acc[-1], row], self.source, symbol, timeframe,
+                        )
+                        if filler:
+                            logger.info(f"Backfilled {len(filler)} missing bars for {symbol}")
+                        for missing_row in filler:
+                            signal = await _step(missing_row, gap_recovered=True)
+                            if signal is not None:
+                                yield signal
+
+                    signal = await _step(row, gap_recovered=False)
+                    if signal is not None:
+                        if provisional:
+                            signal.provisional = True
+                        yield signal
+        finally:
+            pump_task.cancel()
+            await asyncio.gather(pump_task, return_exceptions=True)
+
+    async def _warmup(self, executor: Any, symbol: str, timeframe: int) -> list[dict]:
+        """Closed bars the indicators need, so the first live bar already has real values."""
+        bars = max((i.required_periods() for i in self.indicators.values()), default=0)
+        if not bars:
+            return []
+        scale = UNIT_SCALE.get(self.source.timestamp_unit, 1)
+        now   = int(time.time() * scale)
+        end   = now - now % timeframe - timeframe
+        start = end - (bars * WARMUP_MARGIN - 1) * timeframe
+        df = await executor.fetch_source_data(self.source, symbol, timeframe, start, end)
+        return [r for r in df.to_dicts() if start <= r["timestamp"] <= end]
+
+    async def _closed_bar(
+        self, executor: Any, symbol: str, timeframe: int, last_update: dict,
+    ) -> tuple[dict, bool]:
+        """The exchange's own record of a finished bar, which is what a backtest would
+        see. Falls back to the last stream update, flagged provisional, if it can't be had."""
+        bar_ts = last_update["timestamp"]
+        try:
+            df = await executor.fetch_source_data(self.source, symbol, timeframe, bar_ts, bar_ts)
+            rows = [r for r in df.to_dicts() if r["timestamp"] == bar_ts]
+            if rows:
+                return rows[0], False
+        except Exception as exc:
+            logger.warning(f"{symbol}: official bar {bar_ts} unavailable: {exc}")
+        return last_update, True
+
+    async def _tick(self, update: dict) -> Signal | None:
+        try:
+            signal = await self.strategy.on_tick(update)
+        except Exception as exc:
+            logger.debug(f"on_tick error at {update.get('timestamp')}: {exc}")
+            return None
+        if signal is None:
+            return None
+        signal = _as_signal(signal, update)
+        signal.tick = True
+        return signal
 
     def to_dict(self) -> dict:
         """Serialize to JSON-compatible dict for ClickHouse storage."""

@@ -6,8 +6,9 @@ from bisect import bisect_right
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from tradingkit.core.clickhouse import TIMEFRAME_SECONDS, ClickHouseManager
+from tradingkit.core.clickhouse import ClickHouseManager
 from tradingkit.core.params import IndicatorParams, StrategyParams
+from tradingkit.core.timeframe import bucket_sql, get_period_start, parse_timeframe
 
 if TYPE_CHECKING:
     from tradingkit.executor.base import PluginExecutor
@@ -117,7 +118,7 @@ class DependencyResolver:
         incremental = False
         if row_count > 0 and cached_count >= int(row_count * _CACHE_FRESH_RATIO):
             _, max_candle_ts = await self.db.get_data_range(exchange, symbol, params.timeframe)
-            tf_sec = TIMEFRAME_SECONDS.get(params.timeframe, 60)
+            tf_sec = parse_timeframe(params.timeframe)
             if max_ind_ts and max_candle_ts and max_ind_ts >= max_candle_ts - tf_sec:
                 logger.info(f"Indicator cache HIT: {params.display_name()} {exchange} {symbol}")
                 return
@@ -128,7 +129,7 @@ class DependencyResolver:
 
         plugin = self._load_indicator_plugin(params)
         warmup = plugin.get_required_periods()
-        tf_sec = TIMEFRAME_SECONDS.get(params.timeframe, 60)
+        tf_sec = parse_timeframe(params.timeframe)
 
         if progress_cb:
             await progress_cb({"stage": "computing", "message": f"Computing {params.display_name()}…"})
@@ -147,12 +148,12 @@ class DependencyResolver:
         else:
             context_start = None
 
-        tf_seconds = TIMEFRAME_SECONDS.get(params.timeframe, 60)
+        tf_seconds = parse_timeframe(params.timeframe)
         end_ts     = int(__import__("time").time())
         start_ts   = context_start or 0
 
         df = await self.db.fetch_data_df(
-            exchange, symbol, tf_seconds, start_ts, end_ts
+            exchange, symbol, tf_seconds, start_ts, end_ts, limit=max(row_count, 1)
         )
         if df.height == 0:
             logger.warning(f"No data for {params.timeframe} {exchange} {symbol}")
@@ -188,46 +189,44 @@ class DependencyResolver:
         symbol: str,
         progress_cb: ProgressCb = None,
     ) -> None:
+        """Store the closed bars of `timeframe` that the market's base rows can fill.
+
+        The base is the finest timeframe stored for the market, the one its collector
+        writes. Raises ValueError for a timeframe the base cannot build.
+        """
         import time as _time
-        if timeframe == "1m":
+        base = await self.db.base_timeframe("candles", exchange, symbol)
+        if base is None or timeframe == base:
             return
+        tf_seconds = parse_timeframe(timeframe)
+        base_seconds = parse_timeframe(base)
+        if tf_seconds < base_seconds or tf_seconds % base_seconds:
+            raise ValueError(
+                f"{exchange}/{symbol} is collected as {base} bars, so a timeframe must be a "
+                f"multiple of {base}; {timeframe} is not"
+            )
 
-        tf_seconds = TIMEFRAME_SECONDS.get(timeframe, 60)
-        now_ts = int(_time.time())
-        current_bar_start = (now_ts // tf_seconds) * tf_seconds
-
-        raw_count = await self.db.count_rows(exchange, symbol, "1m")
-        existing  = await self.db.count_rows(exchange, symbol, timeframe)
-        expected  = max(1, (raw_count * 60 - tf_seconds) // tf_seconds)
-
-        if existing >= int(expected * _CACHE_FRESH_RATIO):
-            _, max_cached_ts = await self.db.get_data_range(exchange, symbol, timeframe)
-            last_closed_bar  = current_bar_start - tf_seconds
-            if max_cached_ts and max_cached_ts >= last_closed_bar:
-                return
+        current_bar_start = get_period_start(int(_time.time()), tf_seconds)
+        existing = await self.db.count_rows(exchange, symbol, timeframe)
+        closed   = await self.db.count_closed_bars(exchange, symbol, tf_seconds, current_bar_start, base)
+        if closed and existing >= closed:
+            return
 
         if progress_cb:
             await progress_cb({"stage": "aggregating", "timeframe": timeframe})
 
-        await self._do_ohlcv_aggregation(exchange, symbol, "1m", timeframe)
+        await self._do_ohlcv_aggregation(exchange, symbol, base, timeframe, current_bar_start)
 
     async def _do_ohlcv_aggregation(
-        self, exchange: str, symbol: str, src: str, dst: str
+        self, exchange: str, symbol: str, src: str, dst: str, before_ts: int,
     ) -> None:
-        """Aggregate OHLCV rows via ClickHouse INSERT...SELECT."""
-        from tradingkit.core.clickhouse import _to_ch_interval
-        from tradingkit.core.timeframe import parse_timeframe
-
-        parse_timeframe(src)  # validates src is a well-formed timeframe string; raises if not
-        dst_seconds = parse_timeframe(dst)
-        interval = _to_ch_interval(dst_seconds)
-
+        """Aggregate OHLCV rows via ClickHouse INSERT...SELECT, up to the bar at `before_ts`."""
+        parse_timeframe(src)
+        bucket = bucket_sql("c.timestamp", parse_timeframe(dst))
         sql = f"""
             INSERT INTO candles
             SELECT
-                toUnixTimestamp(toStartOfInterval(
-                    toDateTime(c.timestamp), INTERVAL {interval}
-                ))                             AS timestamp,
+                {bucket}                       AS bar,
                 c.exchange,
                 c.symbol,
                 %(dst)s                        AS timeframe,
@@ -236,23 +235,21 @@ class DependencyResolver:
                 min(c.low)                     AS low,
                 argMax(c.close, c.timestamp)   AS close,
                 sum(c.volume)                  AS volume
-            FROM candles AS c
+            FROM candles AS c FINAL
             WHERE c.exchange  = %(ex)s
               AND c.symbol    = %(sym)s
               AND c.timeframe = %(src)s
-              AND toStartOfInterval(toDateTime(c.timestamp), INTERVAL {interval})
-                  < toStartOfInterval(now(), INTERVAL {interval})
-              AND toStartOfInterval(toDateTime(c.timestamp), INTERVAL {interval})
-                  NOT IN (
-                      SELECT toDateTime(timestamp)
+              AND c.timestamp < %(before)s
+              AND {bucket} NOT IN (
+                      SELECT timestamp
                       FROM candles
                       WHERE exchange = %(ex)s AND symbol = %(sym)s AND timeframe = %(dst)s
                   )
-            GROUP BY
-                toStartOfInterval(toDateTime(c.timestamp), INTERVAL {interval}),
-                c.exchange, c.symbol
+            GROUP BY bar, c.exchange, c.symbol
         """
-        await self.db._execute(sql, {"ex": exchange, "sym": symbol, "src": src, "dst": dst})
+        await self.db._execute(
+            sql, {"ex": exchange, "sym": symbol, "src": src, "dst": dst, "before": before_ts},
+        )
 
     # ------------------------------------------------------------------ #
     # Internal: strategy computation                                       #

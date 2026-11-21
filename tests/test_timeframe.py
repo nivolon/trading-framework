@@ -4,7 +4,9 @@ from __future__ import annotations
 import pytest
 
 from tradingkit.core.timeframe import (
+    WEEK_ORIGIN,
     TimeframeUtils,
+    bucket_sql,
     get_period_end,
     get_period_start,
     parse_timeframe,
@@ -75,3 +77,22 @@ def test_timeframe_utils_lookup_and_fallback():
 def test_timeframe_utils_unsupported_raises():
     with pytest.raises(ValueError):
         TimeframeUtils.get_timeframe_seconds("not-a-timeframe")
+
+def test_weekly_periods_start_on_monday():
+    monday = 1763337600  # 2025-11-17 00:00 UTC
+    assert get_period_start(monday + 3 * 86400, 604800) == monday
+    assert get_period_start(monday, 604800) == monday
+    assert get_period_start(monday - 1, 604800) == monday - 604800
+    assert (WEEK_ORIGIN // 86400 + 4) % 7 == 1  # 1970-01-01 was a Thursday
+
+
+def test_other_periods_count_from_the_epoch():
+    assert get_period_start(1763480000, 420) == 1763480000 // 420 * 420
+    assert get_period_start(1763480000, 172800) == 1763480000 // 172800 * 172800
+
+
+def test_bucket_sql_matches_get_period_start():
+    assert bucket_sql("ts", 300) == "intDiv(ts, 300) * 300"
+    assert bucket_sql("ts", 1209600) == "(intDiv(ts - 345600, 1209600) * 1209600 + 345600)"
+    with pytest.raises(ValueError):
+        bucket_sql("ts", 0)

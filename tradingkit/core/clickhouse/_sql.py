@@ -22,6 +22,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+class ClickHouseQueryError(RuntimeError):
+    """A statement ClickHouse rejected, with the server's message."""
+
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -75,6 +79,8 @@ class _SqlMixin:
     def _fmt(val: Any) -> str:
         if val is None:
             return "NULL"
+        if isinstance(val, (list, tuple)):
+            return "(" + ", ".join(_SqlMixin._fmt(v) for v in val) + ")"
         if isinstance(val, bool):
             return "1" if val else "0"
         if isinstance(val, int):
@@ -92,7 +98,11 @@ class _SqlMixin:
             return _SqlMixin._fmt(params[m.group(1)])
         return re.sub(r"%\((\w+)\)s", _sub, sql)
 
-    async def _execute(self, sql: str, params: dict | None = None, settings: dict | None = None) -> list:
+    async def _execute(
+        self, sql: str, params: dict | None = None, settings: dict | None = None, strict: bool = False,
+    ) -> list:
+        """Run one statement. Errors are logged and give [] unless `strict`, which raises
+        ClickHouseQueryError with the server's message."""
         import aiohttp as _aiohttp
         rendered   = self._interpolate(sql, params)
         first_word = rendered.lstrip().split()[0].upper() if rendered.strip() else ""
@@ -112,13 +122,19 @@ class _SqlMixin:
                 if resp.status != 200:
                     body = await resp.text()
                     logger.error(f"ClickHouse error HTTP {resp.status}: {body[:300]}")
+                    if strict:
+                        raise ClickHouseQueryError(body.strip())
                     return []
                 if is_select:
                     result = await resp.json(content_type=None)
                     return result.get("data", [])
                 return []
+        except ClickHouseQueryError:
+            raise
         except Exception as e:
             logger.error(f"ClickHouse query error: {e}")
+            if strict:
+                raise ClickHouseQueryError(str(e)) from e
             return []
 
     @_validates_identifiers("table")
@@ -137,3 +153,9 @@ class _SqlMixin:
                 logger.debug(f"Inserted {len(rows)} rows into {table}")
             except Exception as e:
                 logger.error(f"Bulk insert into {table} failed: {e}")
+                reopen = getattr(self, "_reopen_native", None)
+                if reopen is not None:
+                    try:
+                        await reopen()
+                    except Exception as reopen_error:
+                        logger.error(f"ClickHouse native connection still unavailable: {reopen_error}")

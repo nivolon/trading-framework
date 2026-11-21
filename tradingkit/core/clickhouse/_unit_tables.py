@@ -13,6 +13,7 @@ from typing import Any
 import polars as pl
 
 from tradingkit.core.clickhouse._sql import _validate_identifier, _validates_identifiers
+from tradingkit.core.timeframe import bucket_sql, get_period_start
 
 # Tokenizer for cross-source combine_sql() expressions (e.g. "btc - eth", "(btc - eth) / eth").
 # Unlike table/column identifiers (_validate_identifier, a closed grammar), this needs to
@@ -87,16 +88,20 @@ class _UnitTablesMixin:
     """Generic raw/aggregated DataUnit tables, backing AggregationContext.query()."""
 
     @_validates_identifiers("table_name")
-    async def ensure_raw_table(self, table_name: str, schema: dict) -> None:
-        """CREATE TABLE IF NOT EXISTS {table_name} (ReplacingMergeTree) from Polars schema."""
+    async def ensure_raw_table(
+        self, table_name: str, schema: dict, updates: str = "replace",
+    ) -> None:
+        """CREATE TABLE IF NOT EXISTS {table_name} from a Polars schema. "replace" keeps the
+        last row per timestamp, "append" keeps every row."""
         from tradingkit.schema import POLARS_TO_CH
         for col in schema:
             _validate_identifier(col, kind="column name")
+        engine = "ReplacingMergeTree" if updates == "replace" else "MergeTree"
         cols = ["exchange String", "symbol String", "timeframe String"]
         cols += [f"{col} {POLARS_TO_CH.get(dtype, 'String')}" for col, dtype in schema.items()]
         await self._execute(
             f"CREATE TABLE IF NOT EXISTS {table_name} ({', '.join(cols)})"
-            " ENGINE = ReplacingMergeTree ORDER BY (exchange, symbol, timestamp)"
+            f" ENGINE = {engine} ORDER BY (exchange, symbol, timestamp)"
         )
         # Tables created before `timeframe` existed here won't get it from CREATE ... IF NOT
         # EXISTS alone -- ADD COLUMN IF NOT EXISTS is the idempotent migration for those.
@@ -130,7 +135,7 @@ class _UnitTablesMixin:
         selects   = [
             "exchange",
             "symbol",
-            f"intDiv(timestamp, {bucket_s}) * {bucket_s} AS bucket",
+            f"{bucket_sql('timestamp', bucket_s)} AS bucket",
         ]
         for f in folds:
             if isinstance(f, Fold):
@@ -151,7 +156,7 @@ class _UnitTablesMixin:
         selects   = [
             "exchange",
             "symbol",
-            f"intDiv(timestamp, {bucket_s}) * {bucket_s} AS bucket",
+            f"{bucket_sql('timestamp', bucket_s)} AS bucket",
         ]
         for f in folds:
             if isinstance(f, Fold):
@@ -187,16 +192,36 @@ class _UnitTablesMixin:
         table_name: str,
         exchange: str,
         symbol: str,
+        timeframe: str,
     ) -> tuple[int | None, int | None]:
-        """min/max timestamp in a raw unit table."""
+        """min/max timestamp of one timeframe in a raw unit table."""
         rows = await self._execute(
-            f"SELECT min(timestamp), max(timestamp) FROM {table_name}"
-            " WHERE exchange = %(ex)s AND symbol = %(sym)s",
-            {"ex": exchange, "sym": symbol},
+            f"SELECT min(timestamp), max(timestamp), count() FROM {table_name}"
+            " WHERE exchange = %(ex)s AND symbol = %(sym)s AND timeframe = %(tf)s",
+            {"ex": exchange, "sym": symbol, "tf": timeframe},
         )
-        if rows and rows[0][0] is not None:
+        if rows and rows[0][2]:
             return int(rows[0][0]), int(rows[0][1])
         return None, None
+
+    @_validates_identifiers("table_name")
+    async def count_unit_rows(
+        self,
+        table_name: str,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> int:
+        """Distinct rows of one timeframe stored in a timestamp range."""
+        rows = await self._execute(
+            f"SELECT count() FROM {table_name} FINAL"
+            " WHERE exchange = %(ex)s AND symbol = %(sym)s AND timeframe = %(tf)s"
+            " AND timestamp BETWEEN %(st)s AND %(et)s",
+            {"ex": exchange, "sym": symbol, "tf": timeframe, "st": start_ts, "et": end_ts},
+        )
+        return int(rows[0][0]) if rows else 0
 
     @_validates_identifiers("table_name")
     async def find_unit_gaps(
@@ -204,6 +229,7 @@ class _UnitTablesMixin:
         table_name: str,
         exchange: str,
         symbol: str,
+        timeframe: str,
         start_ts: int,
         end_ts: int,
         unit_interval_s: int = 60,
@@ -220,13 +246,13 @@ class _UnitTablesMixin:
                     timestamp AS cur_ts,
                     lagInFrame(timestamp) OVER (ORDER BY timestamp) AS prev_ts
                 FROM {table_name} FINAL
-                WHERE exchange = %(ex)s AND symbol = %(sym)s
+                WHERE exchange = %(ex)s AND symbol = %(sym)s AND timeframe = %(tf)s
                   AND timestamp BETWEEN %(st)s AND %(et)s
             )
             WHERE prev_ts > 0 AND (cur_ts - prev_ts) > {unit_interval_s}
         """
         rows = await self._execute(sql, {
-            "ex": exchange, "sym": symbol, "st": start_ts, "et": end_ts,
+            "ex": exchange, "sym": symbol, "tf": timeframe, "st": start_ts, "et": end_ts,
         })
         return [
             {
@@ -266,9 +292,13 @@ class _UnitTablesMixin:
         start_ts: int | None = None,
         end_ts:   int | None = None,
         filters: dict | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> pl.DataFrame:
         """
         Generic SELECT * FROM any raw unit table with optional identity/time filters.
+        Oldest first; `newest_first` with `limit` keeps the latest rows instead, still
+        returned oldest first.
         Returns a Polars DataFrame. Used by AggregationContext.query().
 
         `exchange` is optional: it used to be mandatory, which meant a caller with no
@@ -298,15 +328,101 @@ class _UnitTablesMixin:
         # Every filter is optional now, so the WHERE clause itself has to be -- previously
         # `exchange` was mandatory and there was always at least one part.
         where = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
-        sql = f"SELECT * FROM {table_name}{where} ORDER BY timestamp ASC"
+        sql = f"SELECT * FROM {table_name}{where} ORDER BY timestamp {'DESC' if newest_first else 'ASC'}"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
         rows = await self._execute(sql, params)
         if not rows:
             return pl.DataFrame()
+        if newest_first:
+            rows = list(reversed(rows))
         schema = await self.get_table_schema(table_name)
         col_names = list(schema.keys())
         return pl.DataFrame(
             [dict(zip(col_names, r)) for r in rows],
             schema=schema,
+        )
+
+    @_validates_identifiers("table_name")
+    async def count_rows_by_bucket(
+        self, table_name: str, filters: dict, end_ts: int, bucket_s: int,
+    ) -> dict[int, int]:
+        """{bucket start: distinct timestamps} of the rows up to end_ts. Distinct, because a
+        replacing table holds a forming bar several times until it merges."""
+        where = ["timestamp <= %(et)s"]
+        params: dict[str, Any] = {"et": int(end_ts), "b": int(bucket_s)}
+        for i, col in enumerate(sorted(filters or {})):
+            _validate_identifier(col, kind="filter column")
+            where.append(f"{col} = %(f{i})s")
+            params[f"f{i}"] = filters[col]
+        rows = await self._execute(
+            f"SELECT intDiv(timestamp, %(b)s) * %(b)s AS bucket, uniqExact(timestamp)"
+            f" FROM {table_name} WHERE {' AND '.join(where)} GROUP BY bucket",
+            params, strict=True,
+        )
+        return {int(bucket): int(n) for bucket, n in rows}
+
+    async def _ensure_coverage_table(self) -> None:
+        if getattr(self, "_coverage_ready", False):
+            return
+        await self._execute(
+            "CREATE TABLE IF NOT EXISTS aggregation_coverage (output String, input String,"
+            " bucket Int64, rows UInt64, bound Int64, updated DateTime64(3) DEFAULT now64(3))"
+            " ENGINE = ReplacingMergeTree(updated) ORDER BY (output, input, bucket)",
+            strict=True,
+        )
+        self._coverage_ready = True
+
+    async def load_coverage(self, output: str, input_key: str) -> tuple[int | None, dict[int, int]]:
+        """What an aggregation output was computed from: (the latest timestamp it covered,
+        {bucket: rows of the input up to it}), (None, {}) before it was recorded."""
+        await self._ensure_coverage_table()
+        rows = await self._execute(
+            "SELECT bucket, rows, bound FROM aggregation_coverage FINAL"
+            " WHERE output = %(o)s AND input = %(i)s",
+            {"o": output, "i": input_key}, strict=True,
+        )
+        if not rows:
+            return None, {}
+        return max(int(r[2]) for r in rows), {int(r[0]): int(r[1]) for r in rows}
+
+    async def save_coverage(self, output: str, input_key: str, bound: int, counts: dict[int, int]) -> None:
+        """Record the buckets whose counts changed; `counts` must include the bucket holding
+        `bound`, whose row carries it."""
+        await self._ensure_coverage_table()
+        await self._bulk_insert(
+            "aggregation_coverage", ["output", "input", "bucket", "rows", "bound"],
+            [(output, input_key, bucket, n, int(bound)) for bucket, n in sorted(counts.items())],
+        )
+
+    async def drop_coverage(self, output: str, *, prefix: bool = False) -> None:
+        """Forget the coverage of an output, or with `prefix` of every output starting so."""
+        await self._ensure_coverage_table()
+        match = "startsWith(output, %(o)s)" if prefix else "output = %(o)s"
+        await self._execute(
+            f"ALTER TABLE aggregation_coverage DELETE WHERE {match} SETTINGS mutations_sync = 1",
+            {"o": output}, strict=True,
+        )
+
+    @_validates_identifiers("table_name")
+    async def delete_unit_rows_before(
+        self, table_name: str, exchange: str, symbol: str, before_ts: int | None = None,
+    ) -> None:
+        """Delete one market's rows, all of them or those before `before_ts`."""
+        where = "exchange = %(ex)s AND symbol = %(sym)s"
+        params: dict[str, Any] = {"ex": exchange, "sym": symbol}
+        if before_ts is not None:
+            where += " AND timestamp < %(before)s"
+            params["before"] = int(before_ts)
+        await self._execute(
+            f"ALTER TABLE {table_name} DELETE WHERE {where} SETTINGS mutations_sync = 1", params, strict=True,
+        )
+
+    @_validates_identifiers("table_name")
+    async def delete_rows_since(self, table_name: str, exchange: str, start_ts: int) -> None:
+        await self._execute(
+            f"ALTER TABLE {table_name} DELETE WHERE exchange = %(ex)s AND timestamp >= %(st)s"
+            " SETTINGS mutations_sync = 1", {"ex": exchange, "st": int(start_ts)}, strict=True,
         )
 
     @_validates_identifiers("raw_table")
@@ -339,6 +455,67 @@ class _UnitTablesMixin:
             kw,
         )
         cols = ["bucket"] + aliases
+        return [dict(zip(cols, r)) for r in rows]
+
+    @_validates_identifiers("table_name")
+    async def base_timeframe(self, table_name: str, exchange: str, symbol: str) -> str | None:
+        """The finest timeframe stored for a market: the rows every bucket folds from."""
+        from tradingkit.core.timeframe import parse_timeframe
+        rows = await self._execute(
+            f"SELECT DISTINCT timeframe FROM {table_name} WHERE exchange = %(ex)s AND symbol = %(sym)s",
+            {"ex": exchange, "sym": symbol},
+        )
+        labels = [r[0] for r in rows if r[0]]
+        return min(labels, key=parse_timeframe) if labels else None
+
+    @_validates_identifiers("table_name")
+    async def fold_buckets(
+        self,
+        table_name: str,
+        folds: list,
+        bucket_s: int,
+        exchange: str,
+        symbol: str,
+        base_timeframe: str,
+        start_ts: int | None = None,
+        end_ts: int | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[dict]:
+        """Fold stored rows into `bucket_s` buckets at query time, one dict per bucket.
+
+        Reads the deduplicated rows (FINAL) of one market at `base_timeframe`, so a bar
+        re-inserted while it formed counts once and stored higher timeframes are ignored.
+        `end_ts` is exclusive and refers to bucket starts.
+        """
+        from tradingkit.schema import Fold, PyFold
+        if any(isinstance(f, PyFold) for f in folds):
+            raise ValueError("Python folds (.compute()) cannot be folded in ClickHouse; use Fold methods")
+        bucket_s = int(bucket_s)
+        if bucket_s <= 0:
+            raise ValueError(f"Bucket must be positive, got {bucket_s}")
+        ch_folds = [f for f in folds if isinstance(f, Fold)]
+        aliases = [_validate_identifier(f._alias or f.field, kind="fold alias") for f in ch_folds]
+        if "timestamp" in aliases:
+            raise ValueError("A fold cannot be called 'timestamp': it names the bucket start")
+        selects = [f"{bucket_sql('timestamp', bucket_s)} AS bucket"]
+        selects += [f.ch_expr(a) for f, a in zip(ch_folds, aliases)]
+        where = "exchange = %(ex)s AND symbol = %(sym)s AND timeframe = %(tf)s"
+        params: dict[str, Any] = {"ex": exchange, "sym": symbol, "tf": base_timeframe}
+        if start_ts is not None:
+            where += " AND timestamp >= %(st)s"; params["st"] = get_period_start(int(start_ts), bucket_s)
+        if end_ts is not None:
+            where += " AND timestamp < %(et)s"; params["et"] = get_period_start(int(end_ts), bucket_s)
+        order = "DESC" if newest_first else "ASC"
+        lim = f" LIMIT {int(limit)}" if limit else ""
+        rows = await self._execute(
+            f"SELECT {', '.join(selects)} FROM {table_name} FINAL WHERE {where}"
+            f" GROUP BY bucket ORDER BY bucket {order}{lim}",
+            params,
+            settings={"readonly": 2, "prefer_column_name_to_alias": 1},
+            strict=True,
+        )
+        cols = ["timestamp"] + aliases
         return [dict(zip(cols, r)) for r in rows]
 
     # ------------------------------------------------------------------ #

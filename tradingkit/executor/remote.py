@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 import polars as pl
 import pyarrow as pa
 
-from tradingkit.executor.base import PluginExecutor
+from tradingkit.executor.base import PluginExecutor, SourceSession
 
 if TYPE_CHECKING:
     from tradingkit.indicator import Indicator, IndicatorContext
@@ -48,6 +48,28 @@ def _arrow_bytes_to_df(data: bytes) -> pl.DataFrame:
     return pl.from_arrow(reader.read_all())
 
 
+class _RemoteSourceSession(SourceSession):
+    """Fetches run on the runner; streaming stays in-process, as the runner has no stream
+    endpoint."""
+
+    def __init__(self, source: DataSource, executor: RemoteExecutor) -> None:
+        super().__init__(source)
+        self._executor = executor
+
+    async def fetch(
+        self,
+        symbol: str,
+        timeframe: int,
+        start_ts: int,
+        end_ts: int,
+        limit: int = 5000,
+        stream: str | None = None,
+    ) -> pl.DataFrame:
+        return await self._executor.fetch_source_data(
+            self._source, symbol, timeframe, start_ts, end_ts, limit,
+        )
+
+
 class RemoteExecutor(PluginExecutor):
     """
     Proxies plugin execution to a remote tradingkit-runner HTTP server.
@@ -69,6 +91,11 @@ class RemoteExecutor(PluginExecutor):
         self._timeout = timeout
         self._token = token
         self._session: Any = None
+
+    async def call(self, target, kwargs=None, on_request=None, network=False):
+        raise NotImplementedError(
+            "tradingkit-runner has no call endpoint; use SandboxExecutor to run scripts remotely"
+        )
 
     async def start(self) -> None:
         import aiohttp
@@ -141,6 +168,9 @@ class RemoteExecutor(PluginExecutor):
             return None
         from tradingkit.strategy import Signal
         return Signal.from_dict(result["signal"])
+
+    async def open_source(self, source: DataSource) -> SourceSession:
+        return _RemoteSourceSession(source, self)
 
     async def fetch_source_data(
         self,

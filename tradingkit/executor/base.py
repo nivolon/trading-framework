@@ -4,15 +4,67 @@ tradingkit.executor.base — PluginExecutor ABC.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Self
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Self
 
 import polars as pl
 
 if TYPE_CHECKING:
     from tradingkit.executor.cpp_pool import CppRunnerPool
     from tradingkit.indicator import Indicator, IndicatorContext
+    from tradingkit.sink import Sink
     from tradingkit.source import DataSource
     from tradingkit.strategy import BarContext, Signal, Strategy
+
+
+class SourceSession:
+    """One source instance kept alive for a connection: it is set up once and its HTTP
+    session and state survive between calls."""
+
+    def __init__(self, source: DataSource) -> None:
+        self._source = source
+
+    async def fetch(
+        self,
+        symbol: str,
+        timeframe: int,
+        start_ts: int,
+        end_ts: int,
+        limit: int = 5000,
+        stream: str | None = None,
+    ) -> pl.DataFrame:
+        return await self._source.get_historical_data(
+            symbol, timeframe, start_ts, end_ts, limit, stream,
+        )
+
+    async def stream(
+        self,
+        symbol: str,
+        timeframe: int,
+        on_event: Callable[[dict], None] | None = None,
+        stream: str | None = None,
+    ) -> AsyncIterator[dict]:
+        async for row in self._source.stream(symbol, timeframe, on_event, stream):
+            yield row
+
+    async def batch_gaps(self, gaps: list[dict]) -> list[dict]:
+        return self._source.batch_gaps(gaps)
+
+    async def close(self) -> None:
+        await self._source.shutdown()
+
+
+class SinkSession:
+    """One sink instance kept alive: its connection survives between deliveries."""
+
+    def __init__(self, sink: Sink) -> None:
+        self._sink = sink
+
+    async def deliver(self, event: dict) -> None:
+        await self._sink.deliver(event)
+
+    async def close(self) -> None:
+        await self._sink.shutdown()
 
 
 class PluginExecutor(ABC):
@@ -68,6 +120,56 @@ class PluginExecutor(ABC):
         Call source.get_historical_data() and return pl.DataFrame.
         """
         ...
+
+    async def run_strategy_script(
+        self, code: str, candles: list[dict], params: dict | None = None, name: str = "strategy",
+    ) -> list[dict]:
+        """Run a vectorized strategy script over bars. Default: in-process."""
+        from tradingkit.strategy import run_strategy_script
+        return run_strategy_script(code, candles, params, name)
+
+    async def call(
+        self,
+        target: str,
+        kwargs: dict | None = None,
+        on_request: Callable[[dict], Awaitable[Any]] | None = None,
+        network: bool = False,
+    ) -> Any:
+        """Run a trusted function, `module:function`, and return its result. Default: in
+        this process on a thread; worker-based executors run it in a worker instead.
+        `on_request` answers what the function asks for through its `host` argument."""
+        import asyncio
+        import importlib
+        import inspect
+
+        loop = asyncio.get_running_loop()
+        module_name, _, func_name = target.partition(":")
+        func = getattr(importlib.import_module(module_name), func_name)
+
+        class _Host:
+            def request(self, kind: str, **args: Any) -> Any:
+                if on_request is None:
+                    raise RuntimeError("This task cannot request data")
+                future = asyncio.run_coroutine_threadsafe(on_request({"kind": kind, **args}), loop)
+                return future.result()
+
+        call_kwargs = dict(kwargs or {})
+        if "host" in inspect.signature(func).parameters:
+            call_kwargs["host"] = _Host()
+
+        def run() -> Any:
+            result = func(**call_kwargs)
+            return asyncio.run(result) if inspect.isawaitable(result) else result
+
+        return await asyncio.to_thread(run)
+
+    async def open_sink(self, sink: Sink) -> SinkSession:
+        """A long-lived handle on one sink instance. Default: in-process."""
+        return SinkSession(sink)
+
+    async def open_source(self, source: DataSource) -> SourceSession:
+        """A long-lived handle on one source instance. Default: in-process."""
+        return SourceSession(source)
 
     async def start(self) -> None:
         """Optional: initialize executor resources (subprocesses, connections...)."""

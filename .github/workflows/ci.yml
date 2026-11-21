@@ -9,6 +9,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -81,7 +82,7 @@ jobs:
         run: ruff check .
 
       - name: Test (pytest)
-        run: pytest
+        run: pytest -v
 
       - name: Type-check (mypy, non-blocking)
         run: mypy tradingkit || true

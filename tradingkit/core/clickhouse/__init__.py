@@ -19,6 +19,7 @@ from tradingkit.core.clickhouse._connections import _ConnectionsMixin
 from tradingkit.core.clickhouse._indicators_signals import _IndicatorsSignalsMixin
 from tradingkit.core.clickhouse._plugin_library import _PluginLibraryMixin
 from tradingkit.core.clickhouse._sql import (
+    ClickHouseQueryError,
     _basic_auth_header,
     _SqlMixin,
     _validate_identifier,
@@ -94,6 +95,22 @@ class ClickHouseManager(
             raise
         self._flush_task = asyncio.create_task(self._auto_flush_loop())
 
+    async def _reopen_native(self) -> None:
+        """Replace the native connection: after a failed insert, or once ClickHouse has
+        restarted, it can be left holding an unread result and refuse every insert."""
+        import asynch
+        try:
+            await self._conn.close()
+        except Exception:
+            pass
+        conn = asynch.Connection(
+            host=self.host, port=self.port,
+            database=self.database, user=self.user, password=self.password,
+        )
+        await conn.connect()
+        self._conn = conn
+        logger.info("ClickHouse native connection reopened")
+
     async def close(self) -> None:
         if self._flush_task:
             self._flush_task.cancel()
@@ -127,6 +144,7 @@ def create_clickhouse_manager(config: dict | None = None) -> ClickHouseManager:
 
 __all__ = [
     "TIMEFRAME_SECONDS",
+    "ClickHouseQueryError",
     "ClickHouseManager",
     "_basic_auth_header",
     "_to_ch_interval",
