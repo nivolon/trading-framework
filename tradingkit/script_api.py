@@ -288,8 +288,9 @@ def unbundle(code: str) -> tuple[str, dict[str, str]]:
 
 def script_globals() -> dict[str, Any]:
     """What every script can use without importing it."""
-    from tradingkit.indicator import _ta_ns
     import math
+
+    from tradingkit.indicator import _ta_ns
     return {
         "np": np, "ta": _ta_ns, "math": math, "Series": Series, "Bars": Bars, "Signals": Signals,
         "cross_above": cross_above, "cross_below": cross_below,
@@ -372,7 +373,7 @@ class _ProjectPackage(types.ModuleType):
         self._finder = finder
 
     def __getattr__(self, name: str) -> Any:
-        if name.startswith("__") or name.startswith("_"):
+        if name.startswith("_"):
             raise AttributeError(name)
         key = f"{self._package}.{name}"
         if key not in self._finder.sources:
@@ -424,8 +425,8 @@ def _call(code: str, columns: dict[str, np.ndarray], params: dict[str, Any], nam
 
 
 def _call_entry(code: str, columns: dict[str, np.ndarray], params: dict[str, Any], namespace: dict[str, Any] | None) -> Any:
-    from tradingkit.core.script_errors import ScriptError, run_script
     from tradingkit.core.script_ast import resolve_params
+    from tradingkit.core.script_errors import ScriptError, run_script
 
     scope = {**script_globals(), **(namespace or {})}
     run_script(code, "<script>", scope)
@@ -452,7 +453,8 @@ def _call_entry(code: str, columns: dict[str, np.ndarray], params: dict[str, Any
         import traceback
         lines = [f.lineno for f in traceback.extract_tb(exc.__traceback__) if f.filename == "<script>"]
         line = lines[-1] if lines else None
-        raise ScriptError(f"{'Line %d: ' % line if line else ''}{type(exc).__name__}: {exc}", line) from exc
+        where = f"Line {line}: " if line else ""
+        raise ScriptError(f"{where}{type(exc).__name__}: {exc}", line) from exc
 
 
 def call_indicator(code: str, columns: dict[str, np.ndarray], params: dict[str, Any],

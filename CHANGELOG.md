@@ -189,6 +189,9 @@ output plugin, `Sink`, delivers results.
   takes `table_allowed(name)` and refuses every other table.
 
 ### Fixed
+- A connection that keeps only recent days deleted the older rows for the first time
+  only an hour after the machine booted: the first prune compared against a start of 0
+  on the monotonic clock. It now runs straight away.
 - A script indicator that declares a `source` parameter gets the value it was given;
   `load_indicator_plugin()` dropped it, as it does for built-ins that read it themselves.
 - **`tradingkit.__version__` said `0.1.0`.** It now reads the installed package version.

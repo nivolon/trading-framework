@@ -174,7 +174,7 @@ class _ConnectionWorker:
         # and never fetched again. 0 keeps everything.
         self._keep_days     = float(hist_cfg.get("keep_days") or 0)
         self._prune_interval = float(hist_cfg.get("prune_interval_s", _PRUNE_INTERVAL))
-        self._last_prune: float = 0.0
+        self._last_prune: float | None = None  # monotonic time; None until the first prune
 
         # Per-connection timing overrides from config JSON. Rate limiting and gap
         # batching are NOT here -- they live on the source (DataSource.rate_limit /
@@ -434,7 +434,11 @@ class _ConnectionWorker:
 
     async def _prune(self) -> None:
         """Delete the rows this connection no longer keeps, at most once per prune interval."""
-        if not self._keep_days or time.monotonic() - self._last_prune < self._prune_interval:
+        # monotonic() counts from boot, so on a machine up for less than an interval a start
+        # of 0 would read as "pruned just now": the first prune never waits.
+        if not self._keep_days or (
+            self._last_prune is not None and time.monotonic() - self._last_prune < self._prune_interval
+        ):
             return
         self._last_prune = time.monotonic()
         cutoff = self._keep_from()
@@ -442,11 +446,11 @@ class _ConnectionWorker:
         self._log.info(f"Kept {self._keep_days:g} days: rows before {cutoff} deleted")
 
     async def _gap_cycle(self) -> None:
-        await self._prune()
         """One gap-recovery attempt: overlay status, run it, then either clear the overlay
         (progress made) or escalate it to "stalled" once failures cross the threshold --
         never silently restore an overlay status (gap_recovery/stalled) as if it were the
         connection's real prior state."""
+        await self._prune()
         if self.progress["status"] not in ("gap_recovery", "stalled"):
             self._status_before_gap_recovery = self.progress["status"]
         self.progress["status"] = "gap_recovery"

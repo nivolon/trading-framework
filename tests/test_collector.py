@@ -551,6 +551,26 @@ async def test_a_connection_keeps_only_the_days_it_is_told_to():
     assert (exchange, symbol) == ("whitebit", "BTC_USDT") and abs(before - two_days_ago) <= 60
 
 
+async def test_the_first_prune_does_not_wait_on_a_freshly_booted_machine(monkeypatch):
+    """monotonic() counts from boot: on a CI runner up for minutes, a start of 0 read as a
+    prune moments ago and the first one was skipped."""
+    import time as _time
+
+    class PruneDb(FakeDb):
+        def __init__(self):
+            super().__init__()
+            self.deleted = []
+
+        async def delete_unit_rows_before(self, table, exchange, symbol, before_ts=None):
+            self.deleted.append(before_ts)
+
+    monkeypatch.setattr(_time, "monotonic", lambda: 120.0)
+    db = PruneDb()
+    worker = _make_worker(db=db, start_date="2020-01-01T00:00:00Z", config='{"keep_days": 2}')
+    await worker._prune()
+    assert len(db.deleted) == 1
+
+
 async def test_without_a_limit_everything_is_kept():
     class PruneDb(FakeDb):
         async def delete_unit_rows_before(self, *args, **kwargs):

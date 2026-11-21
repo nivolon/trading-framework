@@ -34,7 +34,6 @@ def run_strategy_script(
     from tradingkit.core.script_ast import resolve_params
     from tradingkit.core.script_errors import run_script
     from tradingkit.indicator import _ta_ns
-
     from tradingkit.script_api import call_strategy, is_function_script
 
     column = lambda key: np.array([float(c[key]) for c in candles], dtype=np.float64)

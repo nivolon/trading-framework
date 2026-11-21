@@ -558,6 +558,7 @@ def preview_indicator_script(
     """Run an editor indicator script over candles (Arrow IPC bytes) and return what a
     chart draws. Meant to run in a worker, via executor.call(); `ctx.query()` asks the host."""
     import io
+
     from tradingkit.script_api import call_indicator, is_function_script
     df = pl.read_ipc(io.BytesIO(data)) if data else pl.DataFrame(schema=_OHLCV_SCHEMA)
     column = lambda name, dtype: df[name].to_numpy() if len(df) else np.array([], dtype=dtype)
