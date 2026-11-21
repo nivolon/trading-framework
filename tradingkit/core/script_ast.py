@@ -112,7 +112,8 @@ def script_params(code: str) -> dict[str, dict[str, Any]]:
     the type taken from that value."""
     declared = ScriptAST(code).get_literal("__params__")
     if not isinstance(declared, dict):
-        return {}
+        from tradingkit.script_api import function_params, is_function_script
+        return function_params(code) if is_function_script(code) else {}
     params: dict[str, dict[str, Any]] = {}
     for name, spec in declared.items():
         entry = dict(spec) if isinstance(spec, dict) else {"default": spec}
@@ -133,6 +134,8 @@ def param_problems(code: str) -> list[str]:
     """Mistakes in a script's __params__. A misspelled key or scope would otherwise be
     ignored, and the field would quietly end up somewhere else in the form."""
     problems: list[str] = []
+    if not isinstance(ScriptAST(code).get_literal("__params__"), dict):
+        return problems  # parameters read from a function's signature are the framework's own
     for name, spec in script_params(code).items():
         for key in spec:
             if key not in PARAM_KEYS:

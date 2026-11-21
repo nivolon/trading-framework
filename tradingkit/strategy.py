@@ -35,9 +35,19 @@ def run_strategy_script(
     from tradingkit.core.script_errors import run_script
     from tradingkit.indicator import _ta_ns
 
+    from tradingkit.script_api import call_strategy, is_function_script
+
     column = lambda key: np.array([float(c[key]) for c in candles], dtype=np.float64)
     close = column("close")
     ts = np.array([int(c["timestamp"]) for c in candles], dtype=np.int64)
+    if is_function_script(code):
+        columns = {"timestamp": ts, "open": column("open"), "high": column("high"),
+                   "low": column("low"), "close": close, "volume": column("volume")}
+        return [
+            {"timestamp": int(ts[i]), "signal_type": kind, "confidence": 0.8, "price": float(close[i]),
+             "strategy_name": name, "metadata": {}}
+            for i, kind in call_strategy(code, columns, params or {})
+        ]
     signals: list[dict] = []
     namespace: dict[str, Any] = {
         "close": close, "high": column("high"), "low": column("low"),

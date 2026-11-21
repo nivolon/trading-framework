@@ -238,6 +238,11 @@ class ScriptIndicator(Indicator):
         self._code = code
 
     def compute(self, ctx: IndicatorContext) -> np.ndarray:
+        from tradingkit.script_api import call_indicator, is_function_script
+        if is_function_script(self._code):
+            columns = {col: ctx.df[col].to_numpy() for col in ctx.df.columns}
+            result = call_indicator(self._code, columns, self.params, {"ctx": ctx})
+            return next(iter(result.values())) if isinstance(result, dict) else result
         namespace: dict[str, Any] = {
             **{col: ctx.df[col].to_numpy() for col in ctx.df.columns},
             "ctx": ctx,
@@ -354,15 +359,14 @@ def load_indicator_plugin(type_: str, params_dict: dict) -> Indicator:
         and not k.startswith("_")
     }
 
-    if type_ == "__script__":
+    if type_ in ("__script__", "__jit__"):
         code = params_dict.get("_code", "")
         defaults = _extract_defaults(code)
-        return ScriptIndicator(code=code, **{**defaults, **user_params})
-
-    if type_ == "__jit__":
-        code = params_dict.get("_code", "")
-        defaults = _extract_defaults(code)
-        return JitIndicator(code=code, **{**defaults, **user_params})
+        # `source` names the column a built-in reads; a script that declares it reads it too.
+        if "source" in defaults and "source" in params_dict:
+            user_params["source"] = params_dict["source"]
+        cls = ScriptIndicator if type_ == "__script__" else JitIndicator
+        return cls(code=code, **{**defaults, **user_params})
 
     if type_ == "__cpp__":
         import base64
@@ -554,8 +558,16 @@ def preview_indicator_script(
     """Run an editor indicator script over candles (Arrow IPC bytes) and return what a
     chart draws. Meant to run in a worker, via executor.call(); `ctx.query()` asks the host."""
     import io
+    from tradingkit.script_api import call_indicator, is_function_script
     df = pl.read_ipc(io.BytesIO(data)) if data else pl.DataFrame(schema=_OHLCV_SCHEMA)
     column = lambda name, dtype: df[name].to_numpy() if len(df) else np.array([], dtype=dtype)
+    if is_function_script(code):
+        columns = {name: column(name, np.int64 if name == "timestamp" else np.float64)
+                   for name in ("timestamp", "open", "high", "low", "close", "volume")}
+        result = call_indicator(code, columns, params, {"ctx": _HostQuery(host, exchange), "pl": pl, "df": df})
+        if isinstance(result, dict):
+            result = pl.DataFrame({"timestamp": columns["timestamp"], **result}).fill_nan(None)
+        return _preview_result(result, columns["timestamp"])
     namespace: dict[str, Any] = {
         "close": column("close", np.float64), "high": column("high", np.float64),
         "low": column("low", np.float64), "open": column("open", np.float64),

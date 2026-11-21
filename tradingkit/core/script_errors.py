@@ -13,9 +13,12 @@ class ScriptError(RuntimeError):
 
 
 def run_script(code: str, filename: str, namespace: dict) -> None:
-    """exec() a script, turning its errors into ScriptError with the script line."""
+    """exec() a script, turning its errors into ScriptError with the script line. What the
+    script imports from the project comes bundled with it (tradingkit.script_api)."""
+    from tradingkit.script_api import imports_for, unbundle
     try:
-        exec(compile(code, filename, "exec"), namespace)  # noqa: S102
+        with imports_for(code):
+            exec(compile(unbundle(code)[0], filename, "exec"), namespace)  # noqa: S102
     except SyntaxError as exc:
         raise ScriptError(f"Line {exc.lineno}: {exc.msg}", exc.lineno) from exc
     except Exception as exc:

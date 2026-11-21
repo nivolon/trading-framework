@@ -7,61 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added
-- **Aggregations across markets name roles, not markets.** A script declares
-  `INPUTS = ["a", "b"]` and reads a role with `ctx.input("a", start_ts, end_ts)`;
-  `COMBINE_SQL` names the roles as columns (each input's `close`, or the column
-  `INPUT_FIELDS` gives). A run binds each role to a connection of the project: stored in
-  `plugin_library` as `INSTANCE_TYPE` (`{"script", "inputs"}`) under the run's name.
-  `AggregationWorker` computes every run into a table of its own
-  (`output_table_name(project, run)`), checks the inputs against `table_allowed`, and
-  serves `ctx.input()` only for the roles a run binds. New on the worker:
-  `describe_run()`, `connection_input()` and `drop_output()`. A script with `INPUTS`
-  is a template and never runs by itself; scripts without it run as before.
-- `AggregationContext(db, inputs={role: (table, filters)})` gives `ctx.input()` outside
-  the worker.
-- `tradingkit.collector.connection_storage()` and `ConnectionStorage`: the table a
-  connection writes and the filters that select its rows, read from the source's
-  declarations without running it. The collector uses it too.
-- **`tradingkit.backtest.simulate_trades()` and `TradeRules`.** Trades (timestamp,
-  action) orders over bars as an account would: fills at the next bar's open or the
-  signal bar's close, slippage and fees, position sizing by percent of equity, a fixed
-  amount or the risk to a stop, and stop-loss, take-profit, trailing-stop and time exits,
-  a stop counting before a target within one bar and a gap filling at the open. Returns
-  the stats (net and annual return, buy and hold, drawdown, Sharpe, win rate, profit
-  factor, fees, exit reasons), the trades, the open trade, a thinned equity curve and
-  monthly returns. Actions are 1, -1 and 0, so what a strategy's signals mean stays the
-  caller's choice. `TradeRules.from_dict()` reads form input.
-- **Synthetic markets as a formula.** An aggregation script may declare
-  `FORMULA = "zscore(se3 - dk1, 96)"` instead of combine(): its names are its roles, the
-  inputs are aligned on timestamp and the formula is computed with Polars, parsed and
-  never executed. Arithmetic, abs/sqrt/log/exp, min/max/avg across series and
-  mean/std/zscore/change/pct/lag over windows, whose widest sets the warmup.
-  `tradingkit.formula.parse()` and `evaluate()`; `describe_cross_source()` reports the
-  formula.
-- **A connection can keep only recent history.** `keep_days` in its config: the collector
-  deletes the market's older rows every `prune_interval_s` (an hour by default) and
-  starts history and gap recovery no earlier, so they are not fetched again.
-  `ClickHouseManager.delete_unit_rows_before()` deletes one market's rows.
-- The sandbox spawner sets a worker's process limit only when the worker runs under a
-  uid of its own. RLIMIT_NPROC counts every process and thread of the user, so under a
-  shared uid (the tests, or a spawner without `--uid-first`) it counted the host's processes
-  and left a worker unable to start a thread; on CI that hung a test. Workers also cap
-  tokio's thread pool (`TOKIO_WORKER_THREADS`) like the others.
-- The collector gives a source its connection's `start_date` in `self.config`, so a
-  source can fetch the history the collector will ask for in parts.
-- `Stream` refuses a step that is not a positive whole number, an unknown `updates` and a
-  table that is not a string. Streams are read from a script without running it, so
-  `step=QUARTER` used to arrive as the string "QUARTER" and fail later in the collector.
-- **Runs mend themselves when an input fills a gap.** `AggregationWorker` records, per
-  `heal_bucket_s` (an hour by default), how many rows of each input a run was computed
-  from, in the table `aggregation_coverage`. When an input later gains rows inside that
-  span, as when a connection backfills a gap, the run's output from the first such bucket
-  is deleted and computed again. The record survives restarts; `drop_output()` and
-  `drop_project()` clear it. New on `ClickHouseManager`: `count_rows_by_bucket()`,
-  `load_coverage()`, `save_coverage()`, `drop_coverage()` and `delete_rows_since()`.
-
-## [0.6.0] - 2026-11-18
+## [0.6.0] - 2026-11-21
 
 Plugins written by other people can run safely: a sandbox executor, plain-value worker
 replies and guarded data access. Sources become classes with named streams, and a new
@@ -121,6 +67,74 @@ output plugin, `Sink`, delivers results.
   requires; the old table form stops building in 2027.
 
 ### Added
+- **Indicators and strategies as one function** (`tradingkit.script_api`). The last
+  public top-level function of a script runs; an argument typed `Series` is one series of
+  the bars (close, open, high, low, volume, hl2, hlc3, ohlc4, chosen by a parameter of the
+  same name), one typed `Bars` gets every column, and every other argument with a default
+  is a parameter: `script_params()` reads them from the signature when there is no
+  `__params__`. An indicator returns an array or a dict of named arrays; a strategy
+  returns `Signals(buy=, sell=, exit=)`, with `cross_above()` and `cross_below()`.
+  `ScriptIndicator`, `preview_indicator_script()` and `run_strategy_script()` run such
+  scripts; scripts written the older way run as before. `describe()` gives the inputs,
+  parameters, output and imports for an editor.
+- **Scripts import each other.** `from project.indicators import name` gives the function
+  of another script of the project, `from builtin.indicators import rsi` a TA-Lib one
+  taking its usual arguments, and `chartword` the names every script has. The caller that
+  knows the project attaches what a script imports with `bundle(code, modules)`, after the
+  code so its line numbers stay; `run_script()` installs them while the script runs and
+  removes them after. `project_imports()` lists what a script imports, without running it.
+- **Aggregations across markets name roles, not markets.** A script declares
+  `INPUTS = ["a", "b"]` and reads a role with `ctx.input("a", start_ts, end_ts)`;
+  `COMBINE_SQL` names the roles as columns (each input's `close`, or the column
+  `INPUT_FIELDS` gives). A run binds each role to a connection of the project: stored in
+  `plugin_library` as `INSTANCE_TYPE` (`{"script", "inputs"}`) under the run's name.
+  `AggregationWorker` computes every run into a table of its own
+  (`output_table_name(project, run)`), checks the inputs against `table_allowed`, and
+  serves `ctx.input()` only for the roles a run binds. New on the worker:
+  `describe_run()`, `connection_input()` and `drop_output()`. A script with `INPUTS`
+  is a template and never runs by itself; scripts without it run as before.
+- `AggregationContext(db, inputs={role: (table, filters)})` gives `ctx.input()` outside
+  the worker.
+- `tradingkit.collector.connection_storage()` and `ConnectionStorage`: the table a
+  connection writes and the filters that select its rows, read from the source's
+  declarations without running it. The collector uses it too.
+- **`tradingkit.backtest.simulate_trades()` and `TradeRules`.** Trades (timestamp,
+  action) orders over bars as an account would: fills at the next bar's open or the
+  signal bar's close, slippage and fees, position sizing by percent of equity, a fixed
+  amount or the risk to a stop, and stop-loss, take-profit, trailing-stop and time exits,
+  a stop counting before a target within one bar and a gap filling at the open. Returns
+  the stats (net and annual return, buy and hold, drawdown, Sharpe, win rate, profit
+  factor, fees, exit reasons), the trades, the open trade, a thinned equity curve and
+  monthly returns. Actions are 1, -1 and 0, so what a strategy's signals mean stays the
+  caller's choice. `TradeRules.from_dict()` reads form input.
+- **Synthetic markets as a formula.** An aggregation script may declare
+  `FORMULA = "zscore(se3 - dk1, 96)"` instead of combine(): its names are its roles, the
+  inputs are aligned on timestamp and the formula is computed with Polars, parsed and
+  never executed. Arithmetic, abs/sqrt/log/exp, min/max/avg across series and
+  mean/std/zscore/change/pct/lag over windows, whose widest sets the warmup.
+  `tradingkit.formula.parse()` and `evaluate()`; `describe_cross_source()` reports the
+  formula.
+- **A connection can keep only recent history.** `keep_days` in its config: the collector
+  deletes the market's older rows every `prune_interval_s` (an hour by default) and
+  starts history and gap recovery no earlier, so they are not fetched again.
+  `ClickHouseManager.delete_unit_rows_before()` deletes one market's rows.
+- The sandbox spawner sets a worker's process limit only when the worker runs under a
+  uid of its own. RLIMIT_NPROC counts every process and thread of the user, so under a
+  shared uid (the tests, or a spawner without `--uid-first`) it counted the host's processes
+  and left a worker unable to start a thread; on CI that hung a test. Workers also cap
+  tokio's thread pool (`TOKIO_WORKER_THREADS`) like the others.
+- The collector gives a source its connection's `start_date` in `self.config`, so a
+  source can fetch the history the collector will ask for in parts.
+- `Stream` refuses a step that is not a positive whole number, an unknown `updates` and a
+  table that is not a string. Streams are read from a script without running it, so
+  `step=QUARTER` used to arrive as the string "QUARTER" and fail later in the collector.
+- **Runs mend themselves when an input fills a gap.** `AggregationWorker` records, per
+  `heal_bucket_s` (an hour by default), how many rows of each input a run was computed
+  from, in the table `aggregation_coverage`. When an input later gains rows inside that
+  span, as when a connection backfills a gap, the run's output from the first such bucket
+  is deleted and computed again. The record survives restarts; `drop_output()` and
+  `drop_project()` clear it. New on `ClickHouseManager`: `count_rows_by_bucket()`,
+  `load_coverage()`, `save_coverage()`, `drop_coverage()` and `delete_rows_since()`.
 - **`bucket_sql(column, seconds)`** is `get_period_start()` as a ClickHouse expression, so
   SQL and Python agree on where a bar starts.
 - **C++ indicators run in a worker (`tradingkit.cpp`).** `preview_cpp_indicator()`
@@ -175,6 +189,8 @@ output plugin, `Sink`, delivers results.
   takes `table_allowed(name)` and refuses every other table.
 
 ### Fixed
+- A script indicator that declares a `source` parameter gets the value it was given;
+  `load_indicator_plugin()` dropped it, as it does for built-ins that read it themselves.
 - **`tradingkit.__version__` said `0.1.0`.** It now reads the installed package version.
 - **A failed insert reopens the native ClickHouse connection.** After ClickHouse
   restarted, the connection was left holding an unread result and refused every insert
